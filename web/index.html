@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>netlogger</title>
+<style>
+  :root{
+    --bg:#0b0e14; --panel:#11151f; --panel2:#0e121b; --line:#1e2634;
+    --fg:#d6deeb; --dim:#8595ad; --faint:#5b6b85;
+    --accent:#e3b341; --link:#6cb6ff; --sel:#1b2740;
+    --get:#7ee787; --post:#6cb6ff; --put:#e3b341; --del:#ff7b72; --other:#c8a3ff;
+    --ok:#7ee787; --redir:#6cb6ff; --warn:#e3b341; --err:#ff7b72;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.5 var(--mono);
+       display:flex;flex-direction:column;overflow:hidden}
+  header{background:var(--panel);border-bottom:1px solid var(--line);padding:8px 12px;
+         display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+  .brand{font-weight:700;color:var(--accent);letter-spacing:.5px;font-size:15px}
+  .fp{color:var(--faint);font-size:11px}
+  .fp b{color:var(--dim);font-weight:600}
+  .cfg{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-left:auto}
+  label{color:var(--dim);font-size:11px;display:flex;gap:5px;align-items:center}
+  input[type=text],input[type=number]{background:var(--panel2);border:1px solid var(--line);
+        color:var(--fg);border-radius:5px;padding:4px 7px;font:12px var(--mono)}
+  input[type=number]{width:74px}
+  input#upstream{width:190px}
+  button{background:var(--panel2);border:1px solid var(--line);color:var(--fg);
+         border-radius:5px;padding:5px 10px;cursor:pointer;font:12px var(--mono)}
+  button:hover{border-color:var(--accent);color:#fff}
+  button.primary{background:var(--accent);color:#0b0e14;border-color:var(--accent);font-weight:700}
+  button.primary:hover{filter:brightness(1.08)}
+  a{color:var(--link);text-decoration:none} a:hover{text-decoration:underline}
+  .toggle{display:flex;gap:5px;align-items:center;cursor:pointer;user-select:none}
+  .toggle input{accent-color:var(--accent)}
+  .msg{font-size:11px;min-height:14px}
+  .msg.ok{color:var(--ok)} .msg.err{color:var(--err)}
+
+  main{flex:1;display:flex;min-height:0}
+  .list{width:46%;min-width:340px;border-right:1px solid var(--line);display:flex;flex-direction:column;min-height:0}
+  .listbar{display:flex;gap:8px;align-items:center;padding:6px 10px;border-bottom:1px solid var(--line);background:var(--panel2)}
+  .listbar input{flex:1}
+  .count{color:var(--faint);font-size:11px;white-space:nowrap}
+  .rows{overflow:auto;flex:1}
+  table{width:100%;border-collapse:collapse}
+  th{position:sticky;top:0;background:var(--panel);color:var(--faint);font-weight:600;
+     text-align:left;font-size:11px;padding:5px 8px;border-bottom:1px solid var(--line);z-index:1}
+  td{padding:4px 8px;border-bottom:1px solid var(--line);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  tr.row{cursor:pointer} tr.row:hover{background:#0f1626}
+  tr.row.sel{background:var(--sel)}
+  .m{font-weight:700}
+  .m.GET{color:var(--get)} .m.POST{color:var(--post)} .m.PUT{color:var(--put)}
+  .m.DELETE{color:var(--del)} .m.PATCH{color:var(--put)} .m.HEAD{color:var(--other)} .m.OPTIONS{color:var(--other)} .m.CONNECT{color:var(--other)}
+  .st.ok{color:var(--ok)} .st.redir{color:var(--redir)} .st.warn{color:var(--warn)} .st.err{color:var(--err)}
+  .host{color:var(--fg)} .path{color:var(--dim)}
+  td.url{max-width:0;width:100%}
+  .tm{color:var(--faint);font-size:11px}
+
+  .detail{flex:1;display:flex;flex-direction:column;min-width:0;min-height:0}
+  .dhead{padding:8px 12px;border-bottom:1px solid var(--line);background:var(--panel2)}
+  .dhead .u{color:var(--fg);word-break:break-all}
+  .dhead .meta{color:var(--faint);font-size:11px;margin-top:3px}
+  .tabs{display:flex;gap:2px;padding:6px 10px 0;border-bottom:1px solid var(--line);background:var(--panel2)}
+  .tab{padding:5px 11px;border:1px solid transparent;border-bottom:none;border-radius:5px 5px 0 0;color:var(--dim);cursor:pointer}
+  .tab.active{background:var(--bg);border-color:var(--line);color:var(--accent)}
+  .tabbody{overflow:auto;flex:1;padding:10px 12px}
+  .kv{display:grid;grid-template-columns:max-content 1fr;gap:0 14px}
+  .kv .k{color:var(--faint);white-space:nowrap}
+  .kv .v{color:var(--fg);word-break:break-all}
+  .sec{color:var(--accent);font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin:14px 0 6px}
+  .sec:first-child{margin-top:0}
+  pre{margin:0;white-space:pre-wrap;word-break:break-word;background:var(--panel2);
+      border:1px solid var(--line);border-radius:6px;padding:10px;max-width:100%}
+  pre.hex{white-space:pre;overflow:auto}
+  .bnote{color:var(--faint);font-size:11px;margin-bottom:6px;display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  .pill{border:1px solid var(--line);border-radius:99px;padding:1px 8px;color:var(--dim);font-size:11px}
+  .empty{color:var(--faint);padding:30px;text-align:center}
+  ::-webkit-scrollbar{width:10px;height:10px}
+  ::-webkit-scrollbar-thumb{background:#1b2333;border-radius:6px}
+  ::-webkit-scrollbar-track{background:transparent}
+</style>
+</head>
+<body>
+<header>
+  <span class="brand">netlogger</span>
+  <span class="fp">JA4 <b id="ja4">…</b> · Akamai <b id="akamai">…</b></span>
+  <div class="cfg">
+    <label>listen :<input type="number" id="port" min="1" max="65535"></label>
+    <label>upstream <input type="text" id="upstream" placeholder="http://127.0.0.1:12345 (blank = direct)"></label>
+    <label class="toggle"><input type="checkbox" id="mitm"> MITM</label>
+    <label class="toggle"><input type="checkbox" id="forceua"> force UA</label>
+    <button class="primary" id="savehar" title="Write current logs as a .har file into ~/Downloads">Save HAR ↓</button>
+    <a href="/ca.pem" download>CA cert ↓</a>
+    <span class="msg" id="msg"></span>
+  </div>
+</header>
+<main>
+  <section class="list">
+    <div class="listbar">
+      <input type="text" id="filter" placeholder="filter: host / path / method / status…">
+      <label class="toggle"><input type="checkbox" id="follow" checked> follow</label>
+      <button id="clear">Clear</button>
+      <span class="count" id="count">0</span>
+    </div>
+    <div class="rows">
+      <table>
+        <thead><tr><th style="width:64px">method</th><th style="width:52px">code</th><th class="url">url</th><th style="width:70px">size</th><th style="width:56px">ms</th></tr></thead>
+        <tbody id="tbody"></tbody>
+      </table>
+      <div class="empty" id="empty">No requests yet. Point Firefox’s HTTP+HTTPS proxy at this listener.</div>
+    </div>
+  </section>
+  <section class="detail">
+    <div class="dhead"><div class="u" id="durl">Select a request</div><div class="meta" id="dmeta"></div></div>
+    <div class="tabs" id="tabs"></div>
+    <div class="tabbody" id="tabbody"><div class="empty">—</div></div>
+  </section>
+</main>
+<script>
+const $=s=>document.querySelector(s), el=(t,c,x)=>{const e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e};
+let maxId=0, rows=[], byId={}, selId=null, curTab='overview', detail=null;
+
+function statusClass(s){ if(!s)return''; if(s<300)return'ok'; if(s<400)return'redir'; if(s<500)return'warn'; return'err'; }
+function fmtSize(n){ if(n<1024)return n+'B'; if(n<1048576)return (n/1024).toFixed(1)+'K'; return (n/1048576).toFixed(1)+'M'; }
+function shortUrl(u){ try{const p=new URL(u); return {host:p.host, path:(p.pathname||'/')+(p.search||'')};}catch{ return {host:'',path:u}; } }
+
+async function loadStatus(){
+  const s=await (await fetch('/api/status')).json();
+  $('#ja4').textContent=s.ja4; $('#akamai').textContent=s.akamai_hash;
+  $('#port').value=s.proxy_port; $('#mitm').checked=s.mitm; $('#forceua').checked=s.force_ua;
+  const c=await (await fetch('/api/config')).json();
+  $('#upstream').value=c.upstream_url||'';
+}
+
+function matchFilter(r,f){
+  if(!f)return true; f=f.toLowerCase();
+  return (r.method||'').toLowerCase().includes(f) || (r.url||'').toLowerCase().includes(f)
+      || String(r.status||'').includes(f) || (r.host||'').toLowerCase().includes(f);
+}
+
+function renderRows(){
+  const f=$('#filter').value.trim(); const tb=$('#tbody'); tb.innerHTML='';
+  let shown=0;
+  for(const r of rows){
+    if(!matchFilter(r,f))continue; shown++;
+    const tr=el('tr','row'+(r.id===selId?' sel':'')); tr.dataset.id=r.id;
+    const su=shortUrl(r.url);
+    const tdM=el('td'); tdM.appendChild(el('span','m '+r.method,r.method)); tr.appendChild(tdM);
+    const tdS=el('td'); tdS.appendChild(el('span','st '+statusClass(r.status), r.err? 'ERR' : (r.status||'…'))); tr.appendChild(tdS);
+    const tdU=el('td','url'); tdU.appendChild(el('span','host',su.host)); tdU.appendChild(el('span','path',su.path)); tr.appendChild(tdU);
+    tr.appendChild(el('td',null,fmtSize(r.resp_len||0)));
+    tr.appendChild(el('td','tm',r.duration_ms!=null?r.duration_ms:''));
+    tr.onclick=()=>select(r.id);
+    tb.appendChild(tr);
+  }
+  $('#empty').style.display=shown?'none':'block';
+  $('#count').textContent=rows.length+(f?(' / '+shown+' shown'):'')+' reqs';
+}
+
+async function poll(){
+  try{
+    const d=await (await fetch('/api/logs?after='+maxId)).json();
+    if(d.entries && d.entries.length){
+      const atTop=$('.rows').scrollTop<40;
+      for(const e of d.entries){ if(!byId[e.id]){ byId[e.id]=e; rows.unshift(e); } if(e.id>maxId)maxId=e.id; }
+      if(rows.length>4000)rows=rows.slice(0,4000);
+      renderRows();
+      if($('#follow').checked && atTop)$('.rows').scrollTop=0;
+    }
+  }catch{}
+}
+
+function tabsFor(){ return ['overview','request','response']; }
+function setTab(t){ curTab=t; renderTabs(); renderTabBody(); }
+function renderTabs(){
+  const w=$('#tabs'); w.innerHTML='';
+  for(const t of tabsFor()){ const e=el('div','tab'+(t===curTab?' active':''),t); e.onclick=()=>setTab(t); w.appendChild(e); }
+}
+
+function headerTable(hs){
+  const d=el('div','kv');
+  (hs||[]).forEach(h=>{ d.appendChild(el('div','k',h.name)); d.appendChild(el('div','v',h.value)); });
+  if(!hs||!hs.length)d.appendChild(el('div','k','(none)'));
+  return d;
+}
+function bodyBlock(b,id,side){
+  const wrap=el('div');
+  const note=el('div','bnote');
+  note.appendChild(el('span','pill', fmtSize(b.size)+' on wire'));
+  if(b.encoding)note.appendChild(el('span','pill', b.encoding + (b.was_decoded?' → decoded '+fmtSize(b.decoded_size):' (not decoded)')));
+  if(b.content_type)note.appendChild(el('span','pill', b.content_type.split(';')[0]));
+  if(b.size>0){
+    const raw=el('a',null,'raw ↓'); raw.href='/api/logs/'+id+'/body?side='+side+'&mode=raw'; raw.target='_blank';
+    note.appendChild(raw);
+    if(b.encoding){ const dec=el('a',null,'decoded ↓'); dec.href='/api/logs/'+id+'/body?side='+side+'&mode=decoded'; dec.target='_blank'; note.appendChild(dec); }
+  }
+  wrap.appendChild(note);
+  if(b.size===0){ wrap.appendChild(el('div','empty','(empty body)')); return wrap; }
+  const pre=el('pre', b.is_text?'':'hex', b.is_text? b.text : (b.hex||'')); wrap.appendChild(pre);
+  if(b.truncated)wrap.appendChild(el('div','bnote','Showing first 2 MiB — use the download links above for the full body.'));
+  return wrap;
+}
+
+function renderTabBody(){
+  const w=$('#tabbody'); w.innerHTML=''; if(!detail){w.innerHTML='<div class="empty">—</div>';return;}
+  const d=detail;
+  if(curTab==='overview'){
+    const g=el('div','kv');
+    const add=(k,v)=>{g.appendChild(el('div','k',k));g.appendChild(el('div','v',String(v)));};
+    add('id',d.id); add('time',d.time); add('client',d.client_addr); add('method',d.method);
+    add('url',d.url); add('status',(d.status||'')+(d.err?(' — '+d.err):'')); add('proto',d.resp_proto||'');
+    add('duration',d.duration_ms+' ms'); add('upstream',d.upstream); add('req bytes',d.req_body.size); add('resp bytes',d.resp_body.size);
+    w.appendChild(g); return;
+  }
+  if(curTab==='request'){
+    w.appendChild(el('div','sec','Request line')); w.appendChild(el('pre',null,d.method+' '+d.url+' '+(d.req_proto||'')));
+    w.appendChild(el('div','sec','Request headers')); w.appendChild(headerTable(d.req_headers));
+    w.appendChild(el('div','sec','Request body')); w.appendChild(bodyBlock(d.req_body,d.id,'req')); return;
+  }
+  if(curTab==='response'){
+    w.appendChild(el('div','sec','Status')); w.appendChild(el('pre',null,(d.resp_proto||'HTTP')+' '+(d.status||'')));
+    w.appendChild(el('div','sec','Response headers')); w.appendChild(headerTable(d.resp_headers));
+    w.appendChild(el('div','sec','Response body')); w.appendChild(bodyBlock(d.resp_body,d.id,'resp')); return;
+  }
+}
+
+async function select(id){
+  selId=id; renderRows();
+  detail=await (await fetch('/api/logs/'+id)).json();
+  const su=shortUrl(detail.url);
+  $('#durl').innerHTML=''; $('#durl').append(el('span','m '+detail.method,detail.method+' '),document.createTextNode(detail.url));
+  $('#dmeta').textContent=`${detail.status||''} · ${detail.resp_proto||''} · ${detail.duration_ms}ms · ${fmtSize(detail.resp_body.size)} · via ${detail.upstream}`;
+  renderTabs(); renderTabBody();
+}
+
+// Config changes apply immediately (no separate save button).
+async function applyConfig(){
+  const body={ listen_port:parseInt($('#port').value,10), upstream_url:$('#upstream').value.trim(),
+               mitm_enabled:$('#mitm').checked, force_ua:$('#forceua').checked };
+  const m=$('#msg');
+  try{
+    const r=await (await fetch('/api/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)})).json();
+    if(r.ok){ m.className='msg ok'; m.textContent='config applied · proxy :'+r.proxy_port; $('#port').value=r.proxy_port; }
+    else{ m.className='msg err'; m.textContent=r.error||'error'; }
+  }catch(e){ m.className='msg err'; m.textContent=String(e); }
+  setTimeout(()=>{ if(m.className==='msg ok')m.textContent=''; },3000);
+}
+['#port','#upstream','#mitm','#forceua'].forEach(s=>$(s).addEventListener('change',applyConfig));
+
+// Save = download current logs as a HAR file via the browser.
+$('#savehar').onclick=()=>{
+  const a=document.createElement('a'); a.href='/api/har'; a.download='';
+  document.body.appendChild(a); a.click(); a.remove();
+  const m=$('#msg'); m.className='msg ok'; m.textContent='downloading HAR…';
+  setTimeout(()=>{ if(m.className==='msg ok')m.textContent=''; },4000);
+};
+$('#clear').onclick=async()=>{ await fetch('/api/clear',{method:'POST'}); rows=[];byId={};selId=null;detail=null;maxId=0; renderRows(); $('#tabbody').innerHTML='<div class="empty">—</div>'; $('#durl').textContent='Select a request'; $('#dmeta').textContent=''; };
+$('#filter').oninput=renderRows;
+
+loadStatus(); renderTabs(); poll(); setInterval(poll,1000); setInterval(loadStatus,5000);
+</script>
+</body>
+</html>
