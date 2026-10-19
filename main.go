@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -24,6 +25,12 @@ func main() {
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		log.Fatalf("data dir: %v", err)
+	}
+	// Mirror the process log (errors, recovered panics) into the data dir so a
+	// failure leaves a trace even when the terminal is gone.
+	if lf, err := os.OpenFile(filepath.Join(dir, "netlogger.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
+		log.SetOutput(io.MultiWriter(os.Stderr, lf))
+		log.Printf("netlogger starting (pid %d)", os.Getpid())
 	}
 
 	cfgStore, err := newConfigStore(filepath.Join(dir, "config.json"))

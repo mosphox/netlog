@@ -45,6 +45,7 @@ func (ws *webServer) routes() *stdhttp.ServeMux {
 	mux.HandleFunc("GET /api/logs", ws.handleList)
 	mux.HandleFunc("GET /api/logs/{id}", ws.handleDetail)
 	mux.HandleFunc("GET /api/logs/{id}/body", ws.handleBody)
+	mux.HandleFunc("POST /api/logs/{id}/replay", ws.handleReplay)
 	mux.HandleFunc("POST /api/clear", ws.handleClear)
 	mux.HandleFunc("GET /api/har", ws.handleHAR)
 	mux.HandleFunc("GET /ca.pem", ws.handleCA)
@@ -78,7 +79,7 @@ func (ws *webServer) handleIndex(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 
 func (ws *webServer) handleStatus(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 	cfg := ws.srv.cfgStore.get()
-	_, upDesc := ws.srv.getClient()
+	_, upDesc := ws.srv.upstreamInfo()
 	writeJSON(w, map[string]any{
 		"proxy_port":   ws.srv.currentPort(),
 		"upstream":     upDesc,
@@ -91,6 +92,8 @@ func (ws *webServer) handleStatus(w stdhttp.ResponseWriter, r *stdhttp.Request) 
 		"akamai_text":  targetAkText,
 		"count":        ws.srv.logs.count(),
 		"max_id":       ws.srv.logs.maxID(),
+		"upstream_url": cfg.UpstreamURL,
+		"listening":    ws.srv.currentPort() != 0,
 		"ca_path":      ws.caPath,
 		"data_dir":     ws.dataDir,
 	})
@@ -123,12 +126,14 @@ func (ws *webServer) handleSetConfig(w stdhttp.ResponseWriter, r *stdhttp.Reques
 }
 
 func (ws *webServer) handleList(w stdhttp.ResponseWriter, r *stdhttp.Request) {
-	after, _ := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
-	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	if limit <= 0 || limit > 1000 {
-		limit = 300
+	q := r.URL.Query()
+	after, _ := strconv.ParseInt(q.Get("after"), 10, 64)
+	before, _ := strconv.ParseInt(q.Get("before"), 10, 64)
+	limit, _ := strconv.Atoi(q.Get("limit"))
+	if limit <= 0 || limit > 5000 {
+		limit = 500
 	}
-	entries, maxID := ws.srv.logs.list(after, limit)
+	entries, maxID := ws.srv.logs.list(after, before, limit)
 	out := make([]map[string]any, 0, len(entries))
 	for _, e := range entries {
 		out = append(out, map[string]any{
@@ -136,6 +141,7 @@ func (ws *webServer) handleList(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 			"method": e.Method, "scheme": e.Scheme, "host": e.Host, "url": e.URL,
 			"status": e.Status, "req_len": e.ReqLen, "resp_len": e.RespLen,
 			"duration_ms": e.DurationMs, "err": e.Err, "client": e.ClientAddr,
+			"attempts": e.Attempts, "ws": e.WS, "ws_count": e.WSCount, "ct": e.CT,
 		})
 	}
 	writeJSON(w, map[string]any{"max_id": maxID, "entries": out})
@@ -148,14 +154,48 @@ func (ws *webServer) handleDetail(w stdhttp.ResponseWriter, r *stdhttp.Request) 
 		stdhttp.Error(w, "not found", 404)
 		return
 	}
-	writeJSON(w, map[string]any{
+	writeJSON(w, detailView(t))
+}
+
+func detailView(t *Transaction) map[string]any {
+	msgs := make([]map[string]any, 0, len(t.WSMessages))
+	for _, m := range t.WSMessages {
+		v := map[string]any{"time": m.Time.Format(time.RFC3339Nano), "from_client": m.FromClient, "opcode": m.Opcode, "len": m.Len, "size": len(m.Data)}
+		if m.Opcode == 1 || m.Opcode == -1 || (m.Opcode == 8 && len(m.Data) <= 2) || utf8.Valid(m.Data) && looksText(m.Data, "") {
+			v["text"] = string(m.Data)
+			if m.Opcode == 8 && len(m.Data) >= 2 {
+				v["text"] = fmt.Sprintf("close %d %s", int(m.Data[0])<<8|int(m.Data[1]), m.Data[2:])
+			}
+		} else {
+			v["hex"] = hexDump(m.Data)
+		}
+		msgs = append(msgs, v)
+	}
+	return map[string]any{
 		"id": t.ID, "time": t.Time.Format(time.RFC3339Nano), "client_addr": t.ClientAddr,
 		"scheme": t.Scheme, "method": t.Method, "host": t.Host, "url": t.URL, "upstream": t.Upstream,
 		"req_proto": t.ReqProto, "req_headers": t.ReqHeaders, "req_body": bodyView(t.ReqHeaders, t.ReqBody),
 		"status": t.Status, "resp_proto": t.RespProto, "resp_headers": t.RespHeaders,
 		"resp_body":   bodyView(t.RespHeaders, t.RespBody),
-		"duration_ms": t.DurationMs, "err": t.Err,
-	})
+		"duration_ms": t.DurationMs, "err": t.Err, "attempts": t.Attempts,
+		"ws_open": t.WSOpen, "ws_messages": msgs,
+	}
+}
+
+// handleReplay re-sends a logged request upstream and returns the new entry.
+func (ws *webServer) handleReplay(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	t, ok := ws.srv.logs.get(id)
+	if !ok {
+		writeJSON(w, map[string]any{"ok": false, "error": "request not found"})
+		return
+	}
+	nt, err := ws.srv.Replay(t)
+	if err != nil {
+		writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "id": nt.ID, "status": nt.Status, "err": nt.Err})
 }
 
 // handleBody streams a full body for download/viewing. side=req|resp,

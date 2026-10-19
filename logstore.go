@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -18,14 +19,14 @@ type HeaderKV struct {
 // Transaction is one fully-captured request/response pair. Bodies are stored in
 // full (no truncation); binary-safe because JSON encodes []byte as base64.
 type Transaction struct {
-	ID         int64      `json:"id"`
-	Time       time.Time  `json:"time"`
-	ClientAddr string     `json:"client_addr"`
-	Scheme     string     `json:"scheme"`
-	Method     string     `json:"method"`
-	Host       string     `json:"host"`
-	URL        string     `json:"url"`
-	Upstream   string     `json:"upstream"` // upstream proxy used, or "direct"
+	ID         int64     `json:"id"`
+	Time       time.Time `json:"time"`
+	ClientAddr string    `json:"client_addr"`
+	Scheme     string    `json:"scheme"`
+	Method     string    `json:"method"`
+	Host       string    `json:"host"`
+	URL        string    `json:"url"`
+	Upstream   string    `json:"upstream"` // upstream proxy used, or "direct"
 
 	ReqProto   string     `json:"req_proto"`
 	ReqHeaders []HeaderKV `json:"req_headers"`
@@ -38,6 +39,20 @@ type Transaction struct {
 
 	DurationMs int64  `json:"duration_ms"`
 	Err        string `json:"err,omitempty"`
+	Attempts   int    `json:"attempts,omitempty"` // upstream tries; >1 means retried on a fresh connection
+
+	WSMessages []WSMessage `json:"ws_messages,omitempty"` // websocket traffic after the 101
+	WSOpen     bool        `json:"ws_open,omitempty"`     // websocket still connected when this record was written
+}
+
+// WSMessage is one websocket message, reassembled from frames and unmasked.
+// Data is decompressed when permessage-deflate was in use.
+type WSMessage struct {
+	Time       time.Time `json:"time"`
+	FromClient bool      `json:"from_client"`
+	Opcode     int       `json:"opcode"`
+	Data       []byte    `json:"data"`
+	Len        int       `json:"len"` // payload size on the wire (Data may be capped)
 }
 
 // entry is the lightweight in-memory index record used for listing and for
@@ -55,6 +70,10 @@ type entry struct {
 	RespLen    int       `json:"resp_len"`
 	DurationMs int64     `json:"duration_ms"`
 	Err        string    `json:"err,omitempty"`
+	Attempts   int       `json:"attempts,omitempty"`
+	WS         bool      `json:"ws,omitempty"`
+	WSCount    int       `json:"ws_count,omitempty"`
+	CT         string    `json:"ct,omitempty"` // response content-type, without parameters
 
 	file string // absolute path of the JSONL file holding the full record
 	off  int64  // byte offset of the record's line
@@ -66,21 +85,22 @@ type entry struct {
 type logStore struct {
 	dir string
 
-	mu       sync.RWMutex
-	entries  []*entry
-	byID     map[int64]*entry
-	nextID   int64
-	curDay   string
-	curFile  *os.File
-	curPath  string
-	curOff   int64
+	mu      sync.RWMutex
+	entries []*entry
+	byID    map[int64]*entry
+	live    map[int64]func() []WSMessage // open websockets
+	nextID  int64
+	curDay  string
+	curFile *os.File
+	curPath string
+	curOff  int64
 }
 
 func newLogStore(dir string) (*logStore, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	ls := &logStore{dir: dir, byID: make(map[int64]*entry)}
+	ls := &logStore{dir: dir, byID: make(map[int64]*entry), live: make(map[int64]func() []WSMessage)}
 	ls.loadIndex()
 	return ls, nil
 }
@@ -105,15 +125,13 @@ func (ls *logStore) loadIndex() {
 				}
 				var t Transaction
 				if json.Unmarshal(trimmed, &t) == nil && t.ID != 0 {
-					e := &entry{
-						ID: t.ID, Time: t.Time, ClientAddr: t.ClientAddr,
-						Scheme: t.Scheme, Method: t.Method, Host: t.Host, URL: t.URL,
-						Status: t.Status, ReqLen: len(t.ReqBody), RespLen: len(t.RespBody),
-						DurationMs: t.DurationMs, Err: t.Err,
-						file: f, off: off, len: len(trimmed),
+					e := entryFor(&t, f, off, len(trimmed))
+					if old, ok := ls.byID[t.ID]; ok {
+						*old = *e // a later record of the same id supersedes (websocket close)
+					} else {
+						ls.entries = append(ls.entries, e)
+						ls.byID[t.ID] = e
 					}
-					ls.entries = append(ls.entries, e)
-					ls.byID[t.ID] = e
 					if t.ID >= ls.nextID {
 						ls.nextID = t.ID + 1
 					}
@@ -167,29 +185,70 @@ func (ls *logStore) add(t *Transaction) int64 {
 	n, _ := ls.curFile.Write(append(line, '\n'))
 	ls.curOff += int64(n)
 
-	e := &entry{
-		ID: t.ID, Time: t.Time, ClientAddr: t.ClientAddr,
-		Scheme: t.Scheme, Method: t.Method, Host: t.Host, URL: t.URL,
-		Status: t.Status, ReqLen: len(t.ReqBody), RespLen: len(t.RespBody),
-		DurationMs: t.DurationMs, Err: t.Err,
-		file: ls.curPath, off: off, len: len(line),
-	}
+	e := entryFor(t, ls.curPath, off, len(line))
 	ls.entries = append(ls.entries, e)
 	ls.byID[t.ID] = e
 	return t.ID
 }
 
-// list returns index entries with ID > afterID, newest first, capped at limit.
-func (ls *logStore) list(afterID int64, limit int) ([]*entry, int64) {
+// update rewrites a transaction that was already added (a websocket that has
+// since closed). The log is append-only: the new record is appended and the
+// index repointed, and on reload the later record wins.
+func (ls *logStore) update(t *Transaction) {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+	if err := ls.rotateIfNeeded(); err != nil {
+		return
+	}
+	line, _ := json.Marshal(t)
+	off := ls.curOff
+	n, _ := ls.curFile.Write(append(line, '\n'))
+	ls.curOff += int64(n)
+	if old, ok := ls.byID[t.ID]; ok {
+		*old = *entryFor(t, ls.curPath, off, len(line))
+	}
+}
+
+// setLive registers (or with nil, removes) a snapshot function for an open
+// websocket, so the detail view shows its messages before it closes.
+func (ls *logStore) setLive(id int64, fn func() []WSMessage) {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+	if fn == nil {
+		delete(ls.live, id)
+		return
+	}
+	ls.live[id] = fn
+}
+
+func entryFor(t *Transaction, file string, off int64, n int) *entry {
+	return &entry{
+		ID: t.ID, Time: t.Time, ClientAddr: t.ClientAddr,
+		Scheme: t.Scheme, Method: t.Method, Host: t.Host, URL: t.URL,
+		Status: t.Status, ReqLen: len(t.ReqBody), RespLen: len(t.RespBody),
+		DurationMs: t.DurationMs, Err: t.Err, Attempts: t.Attempts,
+		WS: t.WSOpen || len(t.WSMessages) > 0 || t.Status == 101, WSCount: len(t.WSMessages),
+		CT:   strings.TrimSpace(strings.SplitN(headerValue(t.RespHeaders, "content-type"), ";", 2)[0]),
+		file: file, off: off, len: n,
+	}
+}
+
+// list returns index entries with afterID < ID < beforeID (beforeID 0 = no
+// upper bound), newest first, capped at limit. Entries are copied so callers
+// can read them without the lock.
+func (ls *logStore) list(afterID, beforeID int64, limit int) ([]entry, int64) {
 	ls.mu.RLock()
 	defer ls.mu.RUnlock()
-	var out []*entry
+	var out []entry
 	for i := len(ls.entries) - 1; i >= 0; i-- {
 		e := ls.entries[i]
 		if e.ID <= afterID {
 			break
 		}
-		out = append(out, e)
+		if beforeID > 0 && e.ID >= beforeID {
+			continue
+		}
+		out = append(out, *e)
 		if limit > 0 && len(out) >= limit {
 			break
 		}
@@ -213,10 +272,17 @@ func (ls *logStore) count() int {
 func (ls *logStore) get(id int64) (*Transaction, bool) {
 	ls.mu.RLock()
 	e, ok := ls.byID[id]
+	var snap func() []WSMessage
+	var where entry
+	if ok {
+		snap = ls.live[id]
+		where = *e
+	}
 	ls.mu.RUnlock()
 	if !ok {
 		return nil, false
 	}
+	e = &where
 	fh, err := os.Open(e.file)
 	if err != nil {
 		return nil, false
@@ -229,6 +295,9 @@ func (ls *logStore) get(id int64) (*Transaction, bool) {
 	var t Transaction
 	if json.Unmarshal(buf, &t) != nil {
 		return nil, false
+	}
+	if snap != nil {
+		t.WSMessages = snap()
 	}
 	return &t, true
 }

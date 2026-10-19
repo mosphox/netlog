@@ -12,6 +12,8 @@
 package fp
 
 import (
+	"net"
+
 	http2 "github.com/bogdanfinn/fhttp/http2"
 	tls_client "github.com/bogdanfinn/tls-client"
 	"github.com/bogdanfinn/tls-client/profiles"
@@ -46,7 +48,7 @@ func clientHelloSpec() (tls.ClientHelloSpec, error) {
 		},
 		CompressionMethods: []byte{tls.CompressionNone},
 		Extensions: []tls.TLSExtension{
-			&tls.SNIExtension{}, // 0  server_name
+			&tls.SNIExtension{},                  // 0  server_name
 			&tls.ExtendedMasterSecretExtension{}, // 23 extended_master_secret
 			&tls.RenegotiationInfoExtension{Renegotiation: tls.RenegotiateOnceAsClient}, // 65281
 			&tls.SupportedCurvesExtension{Curves: []tls.CurveID{ // 10 supported_groups
@@ -57,7 +59,7 @@ func clientHelloSpec() (tls.ClientHelloSpec, error) {
 				tls.CurveP521,      // 25
 			}},
 			&tls.SupportedPointsExtension{SupportedPoints: []byte{tls.PointFormatUncompressed}}, // 11
-			&tls.SessionTicketExtension{}, // 35
+			&tls.SessionTicketExtension{},                                 // 35
 			&tls.ALPNExtension{AlpnProtocols: []string{"h2", "http/1.1"}}, // 16
 			&tls.StatusRequestExtension{},                                 // 5  status_request (ocsp)
 			&tls.DelegatedCredentialsExtension{SupportedSignatureAlgorithms: []tls.SignatureScheme{ // 34
@@ -129,8 +131,8 @@ func clientProfile() profiles.ClientProfile {
 		12517377, // connection flow (WINDOW_UPDATE increment)
 		nil,      // no standalone PRIORITY frames
 		&http2.PriorityParam{StreamDep: 0, Exclusive: false, Weight: 41}, // HEADERS priority (wire 41 => weight 42)
-		0,     // streamID (0 => library default; not part of the Akamai hash)
-		true,  // allowHTTP: also serve plaintext http:// targets
+		0,                       // streamID (0 => library default; not part of the Akamai hash)
+		true,                    // allowHTTP: also serve plaintext http:// targets
 		nil, nil, 0, nil, false, // HTTP/3 unused (upstream is TCP via the proxy)
 	)
 }
@@ -149,4 +151,24 @@ func Options() []tls_client.HttpClientOption {
 		// for byte (with Content-Encoding intact) and decodes only for display.
 		tls_client.WithTransportOptions(&tls_client.TransportOptions{DisableCompression: true}),
 	}
+}
+
+// WebSocketClient wraps conn in a Firefox TLS client for a websocket
+// connection. Firefox opens fresh websocket connections offering only
+// http/1.1 in ALPN, so this is the same ClientHello with that one change.
+func WebSocketClient(conn net.Conn, serverName string) (*tls.UConn, error) {
+	spec, err := clientHelloSpec()
+	if err != nil {
+		return nil, err
+	}
+	for i, ext := range spec.Extensions {
+		if _, ok := ext.(*tls.ALPNExtension); ok {
+			spec.Extensions[i] = &tls.ALPNExtension{AlpnProtocols: []string{"http/1.1"}}
+		}
+	}
+	uc := tls.UClient(conn, &tls.Config{ServerName: serverName, OmitEmptyPsk: true}, tls.HelloCustom, false, true, true)
+	if err := uc.ApplyPreset(&spec); err != nil {
+		return nil, err
+	}
+	return uc, nil
 }

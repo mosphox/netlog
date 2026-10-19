@@ -28,8 +28,8 @@ Firefox ──▶ netlogger :9393 ──(Firefox-158 TLS/H2)──▶ upstream :
 ## Run
 
 ```bash
-cd ~/Desktop/netlogger
-./netlogger
+cd ~/projects/local/netlogger
+go build -o netlogger . && ./netlogger
 ```
 
 Flags: `-web 127.0.0.1:9494` (web UI address), `-data <dir>` (default `./data`),
@@ -64,22 +64,26 @@ Then open <http://127.0.0.1:9494> and browse — requests appear live. Visiting
 
 ## Web UI (`:9494`)
 
-- **Top bar** — set the listen port and the upstream URL (blank = connect directly, no
-  upstream), toggle **MITM** (off = raw pass-through tunnel, HTTPS not decrypted) and
-  **force UA** (rewrite the client User-Agent to the Firefox 158 string). These **apply
-  immediately** on change (the listener rebinds if the port changed) — there is no config
-  save button. **Save HAR ↓** downloads the current logs through the browser as
-  `netlogger-<ts>.har` (HAR 1.2, full headers + bodies; compressed bodies decoded, binary
-  base64-encoded). Download the **CA cert**.
-- **Left** — live request list (method, status, url, size, ms); filter box; follow toggle;
-  Clear.
-- **Right** — Overview / Request / Response tabs with full headers and bodies. Bodies show
-  size on wire, encoding, decoded size, and **raw ↓ / decoded ↓** download links for the
-  complete body.
+- **Top bar**: proxy state (listening port and upstream), **Export HAR**, and **Settings**:
+  listen port, upstream URL (blank = direct), decrypt HTTPS (MITM), force the Firefox UA,
+  the CA download and the fingerprint values. Changes apply immediately.
+- **Filter**: free text matches URL, method, status and error. Structured terms:
+  `host:` `status:` (`404`, `5xx`, `>=400`) `method:` `type:` (`json`, `html`, `js`, `image`…)
+  `path:` and `is:err` `is:ws` `is:retried` `is:replay`. Prefix any term with `-` to exclude.
+  The status chips (2xx … Failed, WebSocket) show counts for the current filter and toggle.
+- **List**: virtualized, so tens of thousands of rows stay smooth. A duration bar (log
+  scale) flags slow requests in amber and failures in red. **Live** keeps the newest row in
+  view; scrolling down pauses it. **Clear list** empties the view; logs on disk stay.
+- **Detail**: Overview (timing, upstream, attempts, query parameters), Request (headers in
+  the order sent, cookies, body), Response (headers, Set-Cookie, body with pretty JSON),
+  and Messages for websockets (both directions, live while open). **Replay** re-sends the
+  request through netlogger; **Copy as curl** and **Copy URL**.
+- Keyboard: `/` filter, `j` / `k` move, `Esc` clears the filter or closes the detail.
 
 ## Data
 
 - `data/config.json` — persisted settings
+- `data/netlogger.log` — process log: errors and any recovered panic with its stack
 - `data/ca-cert.pem`, `data/ca-key.pem` — the CA (key is private)
 - `data/logs/YYYY-MM-DD.jsonl` — every transaction, in full, one JSON object per line
   (bodies base64-encoded). This is the untruncated source of truth; the web UI reads from
@@ -92,21 +96,39 @@ Then open <http://127.0.0.1:9494> and browse — requests appear live. Visiting
   applied to the TLS handshake with the **destination**, tunneled through that upstream.
 - **Cleartext `http://`** has no TLS layer to fingerprint; it is forwarded through a plain
   proxied client (still logged in full).
-- **WebSocket / `Upgrade`** requests are not intercepted (logged as `501`); everything else
-  is.
+- **WebSockets** are relayed and logged: netlogger opens its own connection to the origin
+  with the Firefox ClientHello (ALPN `http/1.1` only, as Firefox does for a fresh websocket
+  connection), replays the browser's handshake in order, and records every message.
+  permessage-deflate is decoded for display. Up to 5000 messages / 32 MB per connection are
+  kept; the connection itself is never limited.
+- **Loopback targets** (`127.0.0.1`, `localhost`) are always dialed directly, never through
+  the upstream. Some antibot scripts probe local ports over websockets; those fail exactly as
+  they would without the proxy.
 - The client↔proxy leg is negotiated as HTTP/1.1 for clean parsing; this does not affect the
   HTTP/2 fingerprint presented upstream. Forwarded request headers are lowercased (as HTTP/2
   and real Firefox require) and the client's `Content-Length` is dropped so the transport
   frames the body — without this, strict servers reject with `400` / `PROTOCOL_ERROR`.
 - **Save HAR** exports everything currently in the list. Hit **Clear** first for a focused
   capture of just the next thing you do.
-- **Resilience:** the upstream client is a small pool with a 30 s per-request timeout and a
-  15 s dial timeout. This is deliberate — tls-client performs the upstream dial + TLS
-  handshake while holding an internal cache lock, so without these bounds a single stalled
-  upstream could freeze *all* HTTPS. The trade-off is that a legitimately slow upstream
-  request is cut at 30 s (fine for browsing; turn MITM off for large downloads).
+- **Connections, like Firefox:** each upstream host gets its own clients: one connection for
+  an HTTP/2 host, up to 6 for an HTTP/1.1 host. A slow host can't stall the others.
+  Upstream connections idle for 30 s are not reused (proxies drop idle tunnels).
+- **Retries:** a request that fails on a dead connection (EOF, reset, GOAWAY, a protocol
+  switch) is sent again on a fresh one: up to 3 tries for GET-like methods, 2 for POST.
+  Retried rows carry a "retried" badge. Certificate, DNS and timeout errors are not retried.
+- **Timeout:** 90 s per upstream request, body included. Responses are buffered in full
+  before they reach the browser, so very large downloads are better done with MITM off.
+- **Upstream certificates** are verified against the macOS trust store, like Firefox's own
+  roots. Sites on the Russian national CA (e.g. some `sberbank.ru`, `rambler.ru` endpoints)
+  fail with `x509: certificate signed by unknown authority`.
 
 ## Dev
+
+- `third_party/tls-client` is a vendored tls-client v1.16.0 (`replace` in `go.mod`) with two
+  race fixes marked `netlogger patch` in `roundtripper.go`. Upstream could panic
+  ("dialTLS returned no error…") or write its transport map without the lock (a fatal
+  concurrent map write) when a host switched between HTTP/1.1 and HTTP/2. Both crashed the
+  whole process. Re-check them before upgrading tls-client.
 
 - `internal/fp/fp.go` — the exact Firefox-158 ClientHello + H2 settings.
 - `go run ./cmd/fpprobe` (add `-proxy http://127.0.0.1:12345`) — prints the live JA3/JA4/

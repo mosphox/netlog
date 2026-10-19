@@ -24,10 +24,10 @@ import (
 // between Firefox and this proxy; the upstream leg carries the real server's
 // certificate chain, which this proxy verifies normally.
 type certAuthority struct {
-	caCert    *x509.Certificate
-	caKey     *rsa.PrivateKey
-	caPEM     []byte // CA certificate in PEM form (the file to import into Firefox)
-	leafKey   *rsa.PrivateKey
+	caCert     *x509.Certificate
+	caKey      *rsa.PrivateKey
+	caPEM      []byte // CA certificate in PEM form (the file to import into Firefox)
+	leafKey    *rsa.PrivateKey
 	leafKeyDER []byte
 
 	mu    sync.Mutex

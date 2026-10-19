@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	http "github.com/bogdanfinn/fhttp"
@@ -70,7 +72,7 @@ func (s *Server) handlePlain(conn net.Conn, br *bufio.Reader, first *rawRequest,
 		if scheme == "" {
 			scheme = "http"
 		}
-		if !s.doAndRelay(conn, scheme, urlAuthority(u.Host, scheme), u.RequestURI(), rr, clientAddr) {
+		if !s.doAndRelay(conn, br, scheme, urlAuthority(u.Host, scheme), u.RequestURI(), rr, clientAddr) {
 			return
 		}
 		rr, err = readRawRequest(br)
@@ -126,7 +128,7 @@ func (s *Server) handleConnect(conn net.Conn, br *bufio.Reader, rr *rawRequest, 
 		if err != nil {
 			return
 		}
-		if !s.doAndRelay(tlsConn, "https", authority, dreq.Target, dreq, clientAddr) {
+		if !s.doAndRelay(tlsConn, sbr, "https", authority, dreq.Target, dreq, clientAddr) {
 			return
 		}
 	}
@@ -135,9 +137,9 @@ func (s *Server) handleConnect(conn net.Conn, br *bufio.Reader, rr *rawRequest, 
 // doAndRelay forwards one request upstream with the Firefox fingerprint, logs
 // the full exchange, and relays the response to the client. It returns whether
 // the client connection should be kept alive.
-func (s *Server) doAndRelay(w io.Writer, scheme, host, target string, rr *rawRequest, clientAddr string) bool {
+func (s *Server) doAndRelay(w io.Writer, cr *bufio.Reader, scheme, host, target string, rr *rawRequest, clientAddr string) bool {
 	cfg := s.cfgStore.get()
-	client, upDesc := s.getClient()
+	_, upDesc := s.upstreamInfo()
 	fullURL := scheme + "://" + host + target
 	keepAlive := wantsKeepAlive(rr)
 
@@ -148,13 +150,25 @@ func (s *Server) doAndRelay(w io.Writer, scheme, host, target string, rr *rawReq
 	}
 
 	if hasUpgrade(rr) {
-		txn.Status = 501
-		txn.Err = "upgrade/websocket not intercepted"
-		s.logs.add(txn)
-		writeSimple(w, 501, "netlogger does not intercept upgraded connections")
-		return false
+		return s.handleUpgrade(w, cr, scheme, host, target, rr, txn, cfg)
 	}
 
+	s.exchange(txn, scheme, host, rr, cfg)
+	if txn.Err != "" {
+		writeSimple(w, 502, "netlogger upstream error: "+txn.Err)
+		return false
+	}
+	if err := writeResponse(w, txn.Status, txn.RespHeaders, txn.RespBody, keepAlive); err != nil {
+		return false
+	}
+	return keepAlive
+}
+
+// exchange performs one request upstream (with retries), fills in the
+// response side of txn, and logs it. A failure is recorded as status 502 with
+// txn.Err set.
+func (s *Server) exchange(txn *Transaction, scheme, host string, rr *rawRequest, cfg Config) {
+	fullURL := txn.URL
 	start := time.Now()
 	var (
 		statusCode  int
@@ -165,71 +179,47 @@ func (s *Server) doAndRelay(w io.Writer, scheme, host, target string, rr *rawReq
 	)
 
 	if scheme == "https" {
-		// Fingerprinted HTTP/2 path with exact header order. tls-client can fail
-		// a request with errProtocolChanged when a cached transport's protocol no
-		// longer matches what the server negotiates; it drops the stale transport
-		// on that error, so a second attempt rebuilds it and succeeds.
-		const maxAttempts = 2
+		// A request that dies on a dead or confused connection is replayed on a
+		// fresh one, as browsers do. Non-idempotent methods get one replay;
+		// the body is fully buffered so replaying is exact.
+		maxAttempts := 3
+		if !idempotent(rr.Method) {
+			maxAttempts = 2
+		}
 		for attempt := 1; attempt <= maxAttempts; attempt++ {
-			var body io.Reader
-			if len(rr.Body) > 0 {
-				body = bytes.NewReader(rr.Body)
-			}
-			req, err := http.NewRequest(rr.Method, fullURL, body)
+			txn.Attempts = attempt
+			pc, desc, err := s.acquire(host)
 			if err != nil {
 				doErr = err
 				break
 			}
-			req.Header = http.Header{}
-			order := make([]string, 0, len(rr.Headers)+1)
-			haveTE := false
-			for _, h := range rr.Headers {
-				ln := strings.ToLower(h.Name)
-				// Skip connection-scoped headers, Host (derived from URL), and
-				// Content-Length (the transport frames the body itself; forwarding
-				// the client's value produces a duplicate that strict servers 400).
-				if hopByHop[ln] || ln == "host" || ln == "content-length" {
-					continue
-				}
-				if ln == "user-agent" && cfg.ForceUA {
-					continue
-				}
-				if ln == "te" {
-					haveTE = true
-				}
-				// HTTP/2 header names must be lowercase; real Firefox sends them
-				// lowercase too. Use the lowercased name as the key (and never
-				// Header.Set, which would Title-Case it).
-				req.Header[ln] = append(req.Header[ln], h.Value)
-				order = append(order, ln)
-			}
-			if cfg.ForceUA {
-				req.Header["user-agent"] = []string{fp.UserAgent}
-				order = append(order, "user-agent")
-			}
-			// Firefox always sends "te: trailers" on h2; add it if the client (on h1) didn't.
-			if !haveTE {
-				req.Header["te"] = []string{"trailers"}
-				order = append(order, "te")
-			}
-			req.Header[http.HeaderOrderKey] = order
-			req.Host = host
-
-			resp, rerr := client.Do(req)
-			if rerr != nil {
-				doErr = rerr
-				if attempt < maxAttempts && strings.Contains(rerr.Error(), "cached transport does not speak") {
-					continue
-				}
+			txn.Upstream = desc
+			req, err := buildUpstreamRequest(rr, fullURL, host, cfg)
+			if err != nil {
+				s.release(host, pc, "")
+				doErr = err
 				break
 			}
-			doErr = nil
-			respBody, _ = io.ReadAll(resp.Body)
-			resp.Body.Close()
-			statusCode = resp.StatusCode
-			respProto = resp.Proto
-			respHeaders = headerKVs(resp.Header)
-			break
+			resp, rerr := pc.c.Do(req)
+			if rerr == nil {
+				respBody, rerr = io.ReadAll(resp.Body)
+				resp.Body.Close()
+				s.release(host, pc, resp.Proto)
+				if rerr == nil {
+					doErr = nil
+					statusCode = resp.StatusCode
+					respProto = resp.Proto
+					respHeaders = headerKVs(resp.Header)
+					break
+				}
+			} else {
+				s.release(host, pc, "")
+			}
+			doErr = rerr
+			if !retryable(rerr) {
+				break
+			}
+			s.discard(host, pc)
 		}
 	} else {
 		// Cleartext http:// via the standard proxied client.
@@ -241,21 +231,114 @@ func (s *Server) doAndRelay(w io.Writer, scheme, host, target string, rr *rawReq
 	if doErr != nil {
 		txn.Status = 502
 		txn.Err = doErr.Error()
-		s.logs.add(txn)
-		writeSimple(w, 502, "netlogger upstream error: "+doErr.Error())
-		return false
+	} else {
+		txn.Status = statusCode
+		txn.RespProto = respProto
+		txn.RespHeaders = respHeaders
+		txn.RespBody = respBody
 	}
-
-	txn.Status = statusCode
-	txn.RespProto = respProto
-	txn.RespHeaders = respHeaders
-	txn.RespBody = respBody
 	s.logs.add(txn)
+}
 
-	if err := writeResponse(w, statusCode, respHeaders, respBody, keepAlive); err != nil {
+// Replay re-sends a logged request through the same upstream path and logs
+// the result as a new transaction. Websocket handshakes cannot be replayed.
+func (s *Server) Replay(orig *Transaction) (*Transaction, error) {
+	u, err := url.Parse(orig.URL)
+	if err != nil {
+		return nil, err
+	}
+	rr := &rawRequest{Method: orig.Method, Target: u.RequestURI(), Proto: orig.ReqProto, Headers: orig.ReqHeaders, Body: orig.ReqBody}
+	if hasUpgrade(rr) {
+		return nil, errors.New("websocket handshakes cannot be replayed")
+	}
+	_, upDesc := s.upstreamInfo()
+	txn := &Transaction{
+		Time: time.Now(), ClientAddr: "replay of #" + strconv.FormatInt(orig.ID, 10), Scheme: orig.Scheme,
+		Method: rr.Method, Host: orig.Host, URL: orig.URL, Upstream: upDesc,
+		ReqProto: rr.Proto, ReqHeaders: rr.Headers, ReqBody: rr.Body,
+	}
+	s.exchange(txn, orig.Scheme, orig.Host, rr, s.cfgStore.get())
+	return txn, nil
+}
+
+// buildUpstreamRequest turns the client's request into the upstream HTTP/2
+// request: lowercase names, original order, Firefox's "te: trailers".
+func buildUpstreamRequest(rr *rawRequest, fullURL, host string, cfg Config) (*http.Request, error) {
+	var body io.Reader
+	if len(rr.Body) > 0 {
+		body = bytes.NewReader(rr.Body)
+	}
+	req, err := http.NewRequest(rr.Method, fullURL, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header = http.Header{}
+	order := make([]string, 0, len(rr.Headers)+1)
+	haveTE := false
+	for _, h := range rr.Headers {
+		ln := strings.ToLower(h.Name)
+		// Skip connection-scoped headers, Host (derived from URL), and
+		// Content-Length (the transport frames the body itself; forwarding
+		// the client's value produces a duplicate that strict servers 400).
+		if hopByHop[ln] || ln == "host" || ln == "content-length" {
+			continue
+		}
+		if ln == "user-agent" && cfg.ForceUA {
+			continue
+		}
+		if ln == "te" {
+			haveTE = true
+		}
+		// HTTP/2 header names must be lowercase; real Firefox sends them
+		// lowercase too. Use the lowercased name as the key (and never
+		// Header.Set, which would Title-Case it).
+		req.Header[ln] = append(req.Header[ln], h.Value)
+		order = append(order, ln)
+	}
+	if cfg.ForceUA {
+		req.Header["user-agent"] = []string{fp.UserAgent}
+		order = append(order, "user-agent")
+	}
+	// Firefox always sends "te: trailers" on h2; add it if the client (on h1) didn't.
+	if !haveTE {
+		req.Header["te"] = []string{"trailers"}
+		order = append(order, "te")
+	}
+	req.Header[http.HeaderOrderKey] = order
+	req.Host = host
+	return req, nil
+}
+
+func idempotent(method string) bool {
+	switch strings.ToUpper(method) {
+	case "GET", "HEAD", "OPTIONS", "PUT", "DELETE", "TRACE":
+		return true
+	}
+	return false
+}
+
+// retryable reports whether an upstream error means the connection was dead
+// or unusable rather than the request being refused: worth one more try on a
+// fresh connection. Certificate, DNS and timeout errors are final.
+func retryable(err error) bool {
+	if err == nil {
 		return false
 	}
-	return keepAlive
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	msg := err.Error()
+	for _, s := range []string{
+		"EOF", "connection reset", "broken pipe", "use of closed network connection",
+		"protocol negotiated", "does not speak", "GOAWAY", "client connection lost",
+		"Proxy responded with non 200", "server closed idle connection",
+	} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
 }
 
 // rawTunnel pipes bytes untouched between client and origin (via the upstream
@@ -273,7 +356,7 @@ func (s *Server) rawTunnel(client net.Conn, br *bufio.Reader, hostport string) {
 		return
 	}
 	defer upstream.Close()
-	go io.Copy(upstream, br) //nolint (client -> upstream, drains buffered bytes)
+	go io.Copy(upstream, br)  //nolint (client -> upstream, drains buffered bytes)
 	io.Copy(client, upstream) // upstream -> client
 }
 

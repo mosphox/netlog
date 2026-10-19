@@ -5,9 +5,9 @@ import (
 	"compress/flate"
 	"compress/gzip"
 	"encoding/base64"
+	"io"
 	stdhttp "net/http"
 	"net/url"
-	"io"
 	"strings"
 
 	"github.com/andybalholm/brotli"

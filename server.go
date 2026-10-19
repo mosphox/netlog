@@ -3,12 +3,13 @@ package main
 import (
 	"fmt"
 	"io"
+	"log"
 	"net"
 	stdhttp "net/http"
 	"net/url"
+	"runtime/debug"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	tls_client "github.com/bogdanfinn/tls-client"
@@ -16,24 +17,45 @@ import (
 	"netlogger/internal/fp"
 )
 
-// clientPoolSize bounds the blast radius of tls-client's cache-lock stall: a
-// stalled upstream handshake only wedges the one pooled client it lands on, so
-// requests round-robined to the others keep flowing. Each client carries the
-// identical Firefox fingerprint.
-const clientPoolSize = 8
+// hostClientIdle is how long an unused host pool is kept before its
+// connections are closed and it is forgotten.
+const hostClientIdle = 3 * time.Minute
 
-// Server owns the proxy listener, the fingerprinted upstream client, the CA and
-// the log store. The upstream client and the listener are rebuilt when config
-// changes from the web UI.
+// h1ConnsPerHost mirrors Firefox's limit of parallel HTTP/1.1 connections per
+// host (network.http.max-persistent-connections-per-server). An HTTP/2 host
+// gets a single connection, as in Firefox.
+const h1ConnsPerHost = 6
+
+// pooledClient is one fingerprinted client inside a host pool.
+type pooledClient struct {
+	c        tls_client.HttpClient
+	inflight int // guarded by Server.mu
+}
+
+// hostPool holds the clients dedicated to one upstream authority. tls-client
+// holds a client-wide lock across each upstream dial and TLS handshake, so
+// sharing a client between hosts lets one slow host stall every other; and
+// within an HTTP/1.1 host, parallel requests need parallel dials, which one
+// client would serialize. Hence: clients per host, several for h1 hosts.
+type hostPool struct {
+	clients  []*pooledClient
+	h1       bool // the host answered over HTTP/1.1, so it may use several connections
+	lastUsed time.Time
+	loopback bool
+}
+
+// Server owns the proxy listener, the fingerprinted upstream clients, the CA
+// and the log store. Clients and the listener are rebuilt when config changes
+// from the web UI.
 type Server struct {
 	cfgStore *configStore
 	ca       *certAuthority
 	logs     *logStore
 
 	mu           sync.Mutex
-	clients      []tls_client.HttpClient // fingerprinted pool, for https
-	clientIdx    uint64                  // round-robin cursor (atomic)
-	stdClient    *stdhttp.Client         // plain, for cleartext http:// (no TLS fingerprint applies)
+	hosts        map[string]*hostPool // authority -> fingerprinted clients, for https
+	upstreamURL  string               // "" = direct
+	stdClient    *stdhttp.Client      // plain, for cleartext http:// (no TLS fingerprint applies)
 	upstreamDesc string
 	ln           net.Listener
 	curPort      int
@@ -44,69 +66,177 @@ func NewServer(cfgStore *configStore, ca *certAuthority, logs *logStore) (*Serve
 	if err := s.rebuildClient(cfgStore.get()); err != nil {
 		return nil, err
 	}
+	go s.reapIdleClients()
 	return s, nil
 }
 
-// rebuildClient constructs a fresh fingerprinted upstream client for the given
-// config (with or without an upstream proxy) and swaps it in atomically.
+// rebuildClient drops every per-host client (they are recreated on demand
+// with the new upstream) and rebuilds the plain-http client.
 func (s *Server) rebuildClient(cfg Config) error {
-	desc := "direct"
-	dialer := net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}
-
-	pool := make([]tls_client.HttpClient, 0, clientPoolSize)
-	for i := 0; i < clientPoolSize; i++ {
-		opts := fp.Options()
-		opts = append(opts,
-			tls_client.WithCookieJar(nil),  // Firefox manages its own cookies
-			tls_client.WithDialer(dialer),  // bound the TCP connect to the upstream
-		)
-		if u := strings.TrimSpace(cfg.UpstreamURL); u != "" {
-			opts = append(opts, tls_client.WithProxyUrl(u))
-			desc = u
+	up := strings.TrimSpace(cfg.UpstreamURL)
+	if up != "" {
+		if _, err := url.Parse(up); err != nil {
+			return fmt.Errorf("bad upstream url: %w", err)
 		}
-		c, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), opts...)
-		if err != nil {
-			return err
-		}
-		pool = append(pool, c)
 	}
+	desc := nonEmpty(up, "direct")
 
 	// Plain cleartext-http client, proxied the same way but without any TLS
 	// fingerprinting (there is no TLS layer to fingerprint on http://).
-	tr := &stdhttp.Transport{DisableCompression: true, TLSHandshakeTimeout: 15 * time.Second}
-	if u := strings.TrimSpace(cfg.UpstreamURL); u != "" {
-		if pu, perr := url.Parse(u); perr == nil {
-			tr.Proxy = stdhttp.ProxyURL(pu)
+	tr := &stdhttp.Transport{DisableCompression: true, TLSHandshakeTimeout: 15 * time.Second, IdleConnTimeout: 30 * time.Second}
+	if up != "" {
+		if pu, perr := url.Parse(up); perr == nil {
+			proxyURL := stdhttp.ProxyURL(pu)
+			tr.Proxy = func(r *stdhttp.Request) (*url.URL, error) {
+				if isLoopbackHost(r.URL.Hostname()) {
+					return nil, nil
+				}
+				return proxyURL(r)
+			}
 		}
 	}
 	std := &stdhttp.Client{
 		Transport:     tr,
-		Timeout:       30 * time.Second,
+		Timeout:       upstreamTimeout,
 		CheckRedirect: func(*stdhttp.Request, []*stdhttp.Request) error { return stdhttp.ErrUseLastResponse },
 	}
 
 	s.mu.Lock()
-	old := s.clients
-	s.clients = pool
+	old := s.hosts
+	s.hosts = make(map[string]*hostPool)
+	s.upstreamURL = up
 	s.stdClient = std
 	s.upstreamDesc = desc
 	s.mu.Unlock()
-	for _, c := range old {
-		c.CloseIdleConnections()
+	for _, hp := range old {
+		for _, pc := range hp.clients {
+			pc.c.CloseIdleConnections()
+		}
 	}
 	return nil
 }
 
-func (s *Server) getClient() (tls_client.HttpClient, string) {
+// upstreamTimeout bounds one upstream request, body included.
+const upstreamTimeout = 90 * time.Second
+
+// acquire returns a fingerprinted client for an authority and marks it busy;
+// the caller must release it. It picks the least busy client of the host's
+// pool and, for HTTP/1.1 hosts, opens another one while all are busy.
+// Loopback targets are dialed directly, never via the upstream.
+func (s *Server) acquire(authority string) (*pooledClient, string, error) {
 	s.mu.Lock()
-	pool := s.clients
-	desc := s.upstreamDesc
-	s.mu.Unlock()
-	if len(pool) == 0 {
-		return nil, desc
+	defer s.mu.Unlock()
+	hp, ok := s.hosts[authority]
+	if !ok {
+		host := authority
+		if h, _, err := net.SplitHostPort(authority); err == nil {
+			host = h
+		}
+		hp = &hostPool{loopback: isLoopbackHost(strings.Trim(host, "[]"))}
+		s.hosts[authority] = hp
 	}
-	i := atomic.AddUint64(&s.clientIdx, 1)
-	return pool[int(i%uint64(len(pool)))], desc
+	hp.lastUsed = time.Now()
+	desc := s.upstreamDesc
+	if hp.loopback {
+		desc = "direct (loopback)"
+	}
+
+	var best *pooledClient
+	for _, pc := range hp.clients {
+		if best == nil || pc.inflight < best.inflight {
+			best = pc
+		}
+	}
+	if best == nil || (best.inflight > 0 && hp.h1 && len(hp.clients) < h1ConnsPerHost) {
+		c, err := s.newClient(hp.loopback)
+		if err != nil {
+			return nil, desc, err
+		}
+		best = &pooledClient{c: c}
+		hp.clients = append(hp.clients, best)
+	}
+	best.inflight++
+	return best, desc, nil
+}
+
+// release marks a client idle again and records the protocol the host spoke.
+func (s *Server) release(authority string, pc *pooledClient, proto string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pc.inflight--
+	if hp, ok := s.hosts[authority]; ok && strings.HasPrefix(proto, "HTTP/1") {
+		hp.h1 = true
+	}
+}
+
+// discard removes a client after a connection-level failure so the retry
+// dials a fresh connection instead of reusing a dead one. In-flight requests
+// on the old client finish on their own.
+func (s *Server) discard(authority string, pc *pooledClient) {
+	s.mu.Lock()
+	if hp, ok := s.hosts[authority]; ok {
+		for i, x := range hp.clients {
+			if x == pc {
+				hp.clients = append(hp.clients[:i:i], hp.clients[i+1:]...)
+				break
+			}
+		}
+	}
+	s.mu.Unlock()
+	pc.c.CloseIdleConnections()
+}
+
+func (s *Server) newClient(loopback bool) (tls_client.HttpClient, error) {
+	idle := 30 * time.Second
+	opts := append(fp.Options(),
+		tls_client.WithCookieJar(nil), // Firefox manages its own cookies
+		tls_client.WithDialer(net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}),
+		tls_client.WithTimeoutSeconds(int(upstreamTimeout/time.Second)),
+		// Upstream proxies drop idle tunnels; don't reuse one that sat for long.
+		tls_client.WithTransportOptions(&tls_client.TransportOptions{DisableCompression: true, IdleConnTimeout: &idle}),
+	)
+	if s.upstreamURL != "" && !loopback {
+		opts = append(opts, tls_client.WithProxyUrl(s.upstreamURL))
+	}
+	return tls_client.NewHttpClient(tls_client.NewNoopLogger(), opts...)
+}
+
+func (s *Server) reapIdleClients() {
+	for range time.Tick(time.Minute) {
+		cutoff := time.Now().Add(-hostClientIdle)
+		var stale []tls_client.HttpClient
+		s.mu.Lock()
+		for k, hp := range s.hosts {
+			busy := false
+			for _, pc := range hp.clients {
+				busy = busy || pc.inflight > 0
+			}
+			if !busy && hp.lastUsed.Before(cutoff) {
+				for _, pc := range hp.clients {
+					stale = append(stale, pc.c)
+				}
+				delete(s.hosts, k)
+			}
+		}
+		s.mu.Unlock()
+		for _, c := range stale {
+			c.CloseIdleConnections()
+		}
+	}
+}
+
+func (s *Server) upstreamInfo() (upstreamURL, desc string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.upstreamURL, s.upstreamDesc
+}
+
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") || strings.HasSuffix(strings.ToLower(host), ".localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // doPlain forwards a cleartext http:// request through the standard proxied
@@ -179,7 +309,15 @@ func (s *Server) acceptLoop(ln net.Listener) {
 		if err != nil {
 			return // listener closed
 		}
-		go s.handleConn(c)
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("panic serving %s: %v\n%s", c.RemoteAddr(), r, debug.Stack())
+					c.Close()
+				}
+			}()
+			s.handleConn(c)
+		}()
 	}
 }
 
