@@ -1,170 +1,176 @@
-// Package fp defines the exact TLS + HTTP/2 fingerprint that netlog presents
-// to upstream, reproducing Firefox 158 on macOS:
+// Package fp holds the browser fingerprints netlog can present upstream: the
+// TLS ClientHello plus HTTP/2 settings, priorities and pseudo-header order of
+// a real browser, and the matching User-Agent.
 //
-//	ja4        t13d1517h2_8daaf6152771_3cbfd9057e0d
-//	ja3_hash   9d42e90b0225e779f03141ddcd699df2
-//	akamai     6ea73faa8fc5aac76bded7bd238f6433  (1:65536;2:0;4:131072;5:16384|12517377|0|m,p,a,s)
-//
-// The ClientHello (15 cipher suites, 17 extensions, X25519MLKEM768 key share) is
-// built by hand rather than reusing tls-client's Firefox_148 preset, because 148
-// still carries the DHE ciphers and FFDHE groups that Firefox 156+ dropped. The
-// HTTP/2 settings are identical to 148 and are reused verbatim.
+// Profiles marked Verified were compared field by field with a capture of the
+// real browser on tls.peet.ws (see cmd/fpprobe -check). The others wrap
+// tls-client's presets and are offered as-is.
 package fp
 
 import (
 	"net"
+	"regexp"
+	"sort"
+	"strconv"
 
-	http2 "github.com/bogdanfinn/fhttp/http2"
 	tls_client "github.com/bogdanfinn/tls-client"
 	"github.com/bogdanfinn/tls-client/profiles"
 	tls "github.com/bogdanfinn/utls"
 )
 
-// UserAgent is the matching Firefox 158 UA string. netlog forces this header
-// on every upstream request so the HTTP layer agrees with the TLS layer.
-const UserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:158.0) Gecko/20100101 Firefox/158.0"
+type Browser string
 
-// clientHelloSpec returns the Firefox 158 ClientHello. Cipher suites and
-// extensions are emitted in the exact wire order recorded in the target's
-// ja4_ro / ja4_o, so both the ordered and unordered JA4 variants match.
-func clientHelloSpec() (tls.ClientHelloSpec, error) {
-	return tls.ClientHelloSpec{
-		CipherSuites: []uint16{
-			tls.TLS_AES_128_GCM_SHA256,                        // 1301
-			tls.TLS_CHACHA20_POLY1305_SHA256,                  // 1303
-			tls.TLS_AES_256_GCM_SHA384,                        // 1302
-			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,       // c02b
-			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,         // c02f
-			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, // cca9
-			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,   // cca8
-			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,       // c02c
-			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,         // c030
-			tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,            // c013
-			tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,            // c014
-			tls.TLS_RSA_WITH_AES_128_GCM_SHA256,               // 009c
-			tls.TLS_RSA_WITH_AES_256_GCM_SHA384,               // 009d
-			tls.TLS_RSA_WITH_AES_128_CBC_SHA,                  // 002f
-			tls.TLS_RSA_WITH_AES_256_CBC_SHA,                  // 0035
-		},
-		CompressionMethods: []byte{tls.CompressionNone},
-		Extensions: []tls.TLSExtension{
-			&tls.SNIExtension{},                  // 0  server_name
-			&tls.ExtendedMasterSecretExtension{}, // 23 extended_master_secret
-			&tls.RenegotiationInfoExtension{Renegotiation: tls.RenegotiateOnceAsClient}, // 65281
-			&tls.SupportedCurvesExtension{Curves: []tls.CurveID{ // 10 supported_groups
-				tls.X25519MLKEM768, // 4588
-				tls.X25519,         // 29
-				tls.CurveP256,      // 23
-				tls.CurveP384,      // 24
-				tls.CurveP521,      // 25
-			}},
-			&tls.SupportedPointsExtension{SupportedPoints: []byte{tls.PointFormatUncompressed}}, // 11
-			&tls.SessionTicketExtension{},                                 // 35
-			&tls.ALPNExtension{AlpnProtocols: []string{"h2", "http/1.1"}}, // 16
-			&tls.StatusRequestExtension{},                                 // 5  status_request (ocsp)
-			&tls.DelegatedCredentialsExtension{SupportedSignatureAlgorithms: []tls.SignatureScheme{ // 34
-				tls.ECDSAWithP256AndSHA256, // 1027
-				tls.ECDSAWithP384AndSHA384, // 1283
-				tls.ECDSAWithP521AndSHA512, // 1539
-				tls.ECDSAWithSHA1,          // 515
-			}},
-			&tls.SCTExtension{}, // 18 signed_certificate_timestamp
-			&tls.KeyShareExtension{KeyShares: []tls.KeyShare{ // 51 key_share
-				{Group: tls.X25519MLKEM768},
-				{Group: tls.X25519},
-				{Group: tls.CurveP256},
-			}},
-			&tls.SupportedVersionsExtension{Versions: []uint16{ // 43
-				tls.VersionTLS13,
-				tls.VersionTLS12,
-			}},
-			&tls.SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: []tls.SignatureScheme{ // 13
-				tls.ECDSAWithP256AndSHA256, // 1027
-				tls.ECDSAWithP384AndSHA384, // 1283
-				tls.ECDSAWithP521AndSHA512, // 1539
-				tls.PSSWithSHA256,          // 2052
-				tls.PSSWithSHA384,          // 2053
-				tls.PSSWithSHA512,          // 2054
-				tls.PKCS1WithSHA256,        // 1025
-				tls.PKCS1WithSHA384,        // 1281
-				tls.PKCS1WithSHA512,        // 1537
-				tls.ECDSAWithSHA1,          // 515
-				tls.PKCS1WithSHA1,          // 513
-			}},
-			&tls.PSKKeyExchangeModesExtension{Modes: []uint8{1}}, // 45 psk_dhe_ke
-			&tls.FakeRecordSizeLimitExtension{Limit: 0x4001},     // 28 record_size_limit = 16385
-			&tls.UtlsCompressCertExtension{Algorithms: []tls.CertCompressionAlgo{ // 27
-				tls.CertCompressionZlib,   // 1
-				tls.CertCompressionBrotli, // 2
-				tls.CertCompressionZstd,   // 3
-			}},
-			tls.BoringGREASEECH(), // 65037 encrypted_client_hello (GREASE)
-		},
-	}, nil
+const (
+	Firefox Browser = "firefox"
+	Chrome  Browser = "chrome"
+)
+
+// Profile is one browser fingerprint.
+type Profile struct {
+	ID        string  `json:"id"`
+	Name      string  `json:"name"`
+	Browser   Browser `json:"browser"`
+	Version   int     `json:"version"`
+	Verified  bool    `json:"verified"`
+	UserAgent string  `json:"user_agent"`
+	JA4       string  `json:"ja4,omitempty"`    // expected, for verified profiles
+	Akamai    string  `json:"akamai,omitempty"` // expected HTTP/2 fingerprint text
+	JA4R      string  `json:"ja4_r,omitempty"`  // expected raw JA4: full sorted cipher/extension/sigalg lists
+	Peetprint string  `json:"peetprint,omitempty"`
+
+	// RandomExtOrder shuffles the ClientHello extensions per connection, as
+	// Chrome does. AddTE adds "te: trailers" to every request, as Firefox does
+	// on HTTP/2.
+	RandomExtOrder bool `json:"random_ext_order"`
+	AddTE          bool `json:"add_te"`
+
+	// NavHeaders is the browser's header set for a top-level navigation, in
+	// its order, used by the probe. An empty user-agent value marks where the
+	// UA goes.
+	NavHeaders [][2]string `json:"-"`
+
+	client profiles.ClientProfile
 }
 
-// clientProfile bundles the Firefox 158 ClientHello with Firefox's HTTP/2
-// settings (identical to tls-client's Firefox_148, which already matches the
-// target Akamai fingerprint exactly).
-func clientProfile() profiles.ClientProfile {
-	helloID := tls.ClientHelloID{
-		Client:               "Firefox",
-		Version:              "158",
-		RandomExtensionOrder: false,
-		SpecFactory:          clientHelloSpec,
+func preset(id, name string, b Browser, version int, ua string, addTE, shuffle bool) *Profile {
+	return &Profile{ID: id, Name: name, Browser: b, Version: version, UserAgent: ua, AddTE: addTE, RandomExtOrder: shuffle, client: profiles.MappedTLSClients[id]}
+}
+
+var all = []*Profile{
+	chrome155,
+	firefox158,
+	preset("chrome_152", "Chrome 152", Chrome, 152, chromeUA(152), false, true),
+	preset("chrome_146", "Chrome 146", Chrome, 146, chromeUA(146), false, true),
+	preset("firefox_148", "Firefox 148", Firefox, 148, firefoxUA(148), true, false),
+	preset("firefox_147", "Firefox 147", Firefox, 147, firefoxUA(147), true, false),
+}
+
+func chromeUA(v int) string {
+	return "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/" + strconv.Itoa(v) + ".0.0.0 Safari/537.36"
+}
+
+func firefoxUA(v int) string {
+	s := strconv.Itoa(v)
+	return "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:" + s + ".0) Gecko/20100101 Firefox/" + s + ".0"
+}
+
+// Default is the profile used when nothing else decides.
+var Default = firefox158
+
+// All returns every profile, verified first, newest first.
+func All() []*Profile {
+	out := append([]*Profile(nil), all...)
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Verified != out[j].Verified {
+			return out[i].Verified
+		}
+		return out[i].Version > out[j].Version
+	})
+	return out
+}
+
+// Lookup returns a profile by ID.
+func Lookup(id string) (*Profile, bool) {
+	for _, p := range all {
+		if p.ID == id {
+			return p, true
+		}
 	}
-	return profiles.NewClientProfile(
-		helloID,
-		map[http2.SettingID]uint32{ // SETTINGS values
-			http2.SettingHeaderTableSize:   65536,
-			http2.SettingEnablePush:        0,
-			http2.SettingInitialWindowSize: 131072,
-			http2.SettingMaxFrameSize:      16384,
-		},
-		[]http2.SettingID{ // SETTINGS order: 1,2,4,5
-			http2.SettingHeaderTableSize,
-			http2.SettingEnablePush,
-			http2.SettingInitialWindowSize,
-			http2.SettingMaxFrameSize,
-		},
-		[]string{":method", ":path", ":authority", ":scheme"}, // pseudo-header order m,p,a,s
-		12517377, // connection flow (WINDOW_UPDATE increment)
-		nil,      // no standalone PRIORITY frames
-		&http2.PriorityParam{StreamDep: 0, Exclusive: false, Weight: 41}, // HEADERS priority (wire 41 => weight 42)
-		0,                       // streamID (0 => library default; not part of the Akamai hash)
-		true,                    // allowHTTP: also serve plaintext http:// targets
-		nil, nil, 0, nil, false, // HTTP/3 unused (upstream is TCP via the proxy)
-	)
+	return nil, false
 }
 
-// Options returns the base tls-client options for the Firefox 158 fingerprint.
-// Callers append WithProxyUrl (upstream) and per-request options as needed.
-func Options() []tls_client.HttpClientOption {
-	return []tls_client.HttpClientOption{
-		tls_client.WithClientProfile(clientProfile()),
+var (
+	reFirefox = regexp.MustCompile(`Firefox/(\d+)`)
+	reChrome  = regexp.MustCompile(`(?:Chrome|Chromium|CriOS)/(\d+)`)
+)
+
+// Detect picks the profile matching a client's User-Agent: same browser
+// family, the closest version (preferring verified profiles on ties). It
+// reports false when the UA is not Firefox or Chromium-based.
+func Detect(ua string) (*Profile, bool) {
+	var fam Browser
+	var ver int
+	if m := reFirefox.FindStringSubmatch(ua); m != nil {
+		fam, ver = Firefox, atoi(m[1])
+	} else if m := reChrome.FindStringSubmatch(ua); m != nil {
+		fam, ver = Chrome, atoi(m[1])
+	} else {
+		return nil, false
+	}
+	var best *Profile
+	bestDist := 1 << 30
+	for _, p := range All() {
+		if p.Browser != fam {
+			continue
+		}
+		d := p.Version - ver
+		if d < 0 {
+			d = -d
+		}
+		if d < bestDist {
+			best, bestDist = p, d
+		}
+	}
+	return best, best != nil
+}
+
+func atoi(s string) int { n, _ := strconv.Atoi(s); return n }
+
+// Options returns the base tls-client options for the profile. Callers append
+// WithProxyUrl and their own transport options.
+func (p *Profile) Options() []tls_client.HttpClientOption {
+	opts := []tls_client.HttpClientOption{
+		tls_client.WithClientProfile(p.client),
 		tls_client.WithNotFollowRedirects(), // a proxy must relay 3xx, never chase them
-		// tls-client runs the upstream dial + TLS handshake while holding an
-		// internal cache lock, bounded only by this request timeout. Keep it
-		// short so a stalled upstream can't freeze other HTTPS requests for long.
-		tls_client.WithTimeoutSeconds(30),
-		// Never let the transport decode content: netlog relays bodies byte
-		// for byte (with Content-Encoding intact) and decodes only for display.
-		tls_client.WithTransportOptions(&tls_client.TransportOptions{DisableCompression: true}),
 	}
+	if p.RandomExtOrder {
+		opts = append(opts, tls_client.WithRandomTLSExtensionOrder())
+	}
+	return opts
 }
 
-// WebSocketClient wraps conn in a Firefox TLS client for a websocket
-// connection. Firefox opens fresh websocket connections offering only
-// http/1.1 in ALPN, so this is the same ClientHello with that one change.
-func WebSocketClient(conn net.Conn, serverName string) (*tls.UConn, error) {
-	spec, err := clientHelloSpec()
+// WebSocketClient wraps conn in this profile's TLS client for a websocket
+// connection. Browsers open fresh websocket connections offering only
+// http/1.1 in ALPN, so this is the profile's ClientHello with that change (and
+// without ALPS, which only accompanies h2).
+func (p *Profile) WebSocketClient(conn net.Conn, serverName string) (*tls.UConn, error) {
+	spec, err := p.client.GetClientHelloSpec()
 	if err != nil {
 		return nil, err
 	}
-	for i, ext := range spec.Extensions {
-		if _, ok := ext.(*tls.ALPNExtension); ok {
-			spec.Extensions[i] = &tls.ALPNExtension{AlpnProtocols: []string{"http/1.1"}}
+	exts := spec.Extensions[:0]
+	for _, ext := range spec.Extensions {
+		switch ext.(type) {
+		case *tls.ALPNExtension:
+			ext = &tls.ALPNExtension{AlpnProtocols: []string{"http/1.1"}}
+		case *tls.ApplicationSettingsExtension, *tls.ApplicationSettingsExtensionNew:
+			continue
 		}
+		exts = append(exts, ext)
+	}
+	spec.Extensions = exts
+	if p.RandomExtOrder {
+		spec.Extensions = tls.ShuffleChromeTLSExtensions(spec.Extensions)
 	}
 	uc := tls.UClient(conn, &tls.Config{ServerName: serverName, OmitEmptyPsk: true}, tls.HelloCustom, false, true, true)
 	if err := uc.ApplyPreset(&spec); err != nil {
