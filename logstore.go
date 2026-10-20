@@ -19,14 +19,18 @@ type HeaderKV struct {
 // Transaction is one fully-captured request/response pair. Bodies are stored in
 // full (no truncation); binary-safe because JSON encodes []byte as base64.
 type Transaction struct {
-	ID         int64     `json:"id"`
-	Time       time.Time `json:"time"`
-	ClientAddr string    `json:"client_addr"`
-	Scheme     string    `json:"scheme"`
-	Method     string    `json:"method"`
-	Host       string    `json:"host"`
-	URL        string    `json:"url"`
-	Upstream   string    `json:"upstream"` // upstream proxy used, or "direct"
+	ID          int64     `json:"id"`
+	Time        time.Time `json:"time"`
+	ClientAddr  string    `json:"client_addr"`
+	Source      string    `json:"source,omitempty"` // "proxy", "repeater", "replay of #N"
+	Scheme      string    `json:"scheme"`
+	Method      string    `json:"method"`
+	Host        string    `json:"host"`
+	URL         string    `json:"url"`
+	Upstream    string    `json:"upstream"`               // upstream proxy name, or "direct"
+	Profile     string    `json:"profile,omitempty"`      // fingerprint profile ID presented upstream
+	ProfileAuto bool      `json:"profile_auto,omitempty"` // picked from the client's User-Agent
+	Intercepted string    `json:"intercepted,omitempty"`  // "forwarded", "edited", "dropped"
 
 	ReqProto   string     `json:"req_proto"`
 	ReqHeaders []HeaderKV `json:"req_headers"`
@@ -58,22 +62,25 @@ type WSMessage struct {
 // entry is the lightweight in-memory index record used for listing and for
 // locating the full transaction on disk.
 type entry struct {
-	ID         int64     `json:"id"`
-	Time       time.Time `json:"time"`
-	ClientAddr string    `json:"client_addr"`
-	Scheme     string    `json:"scheme"`
-	Method     string    `json:"method"`
-	Host       string    `json:"host"`
-	URL        string    `json:"url"`
-	Status     int       `json:"status"`
-	ReqLen     int       `json:"req_len"`
-	RespLen    int       `json:"resp_len"`
-	DurationMs int64     `json:"duration_ms"`
-	Err        string    `json:"err,omitempty"`
-	Attempts   int       `json:"attempts,omitempty"`
-	WS         bool      `json:"ws,omitempty"`
-	WSCount    int       `json:"ws_count,omitempty"`
-	CT         string    `json:"ct,omitempty"` // response content-type, without parameters
+	ID          int64     `json:"id"`
+	Time        time.Time `json:"time"`
+	ClientAddr  string    `json:"client_addr"`
+	Scheme      string    `json:"scheme"`
+	Method      string    `json:"method"`
+	Host        string    `json:"host"`
+	URL         string    `json:"url"`
+	Status      int       `json:"status"`
+	ReqLen      int       `json:"req_len"`
+	RespLen     int       `json:"resp_len"`
+	DurationMs  int64     `json:"duration_ms"`
+	Err         string    `json:"err,omitempty"`
+	Attempts    int       `json:"attempts,omitempty"`
+	WS          bool      `json:"ws,omitempty"`
+	WSCount     int       `json:"ws_count,omitempty"`
+	CT          string    `json:"ct,omitempty"` // response content-type, without parameters
+	Source      string    `json:"source,omitempty"`
+	Profile     string    `json:"profile,omitempty"`
+	Intercepted string    `json:"intercepted,omitempty"`
 
 	file string // absolute path of the JSONL file holding the full record
 	off  int64  // byte offset of the record's line
@@ -227,6 +234,7 @@ func entryFor(t *Transaction, file string, off int64, n int) *entry {
 		Scheme: t.Scheme, Method: t.Method, Host: t.Host, URL: t.URL,
 		Status: t.Status, ReqLen: len(t.ReqBody), RespLen: len(t.RespBody),
 		DurationMs: t.DurationMs, Err: t.Err, Attempts: t.Attempts,
+		Source: t.Source, Profile: t.Profile, Intercepted: t.Intercepted,
 		WS: t.WSOpen || len(t.WSMessages) > 0 || t.Status == 101, WSCount: len(t.WSMessages),
 		CT:   strings.TrimSpace(strings.SplitN(headerValue(t.RespHeaders, "content-type"), ";", 2)[0]),
 		file: file, off: off, len: n,

@@ -16,8 +16,6 @@ import (
 	"time"
 
 	"golang.org/x/net/proxy"
-
-	"github.com/mosphox/netlog/internal/fp"
 )
 
 // Bounds on what one websocket connection may keep in the log. The connection
@@ -32,7 +30,7 @@ const (
 // connection to the origin with the Firefox ClientHello, replays the client's
 // handshake byte for byte, and on 101 pipes both directions while recording
 // the messages. It always ends the client connection.
-func (s *Server) handleUpgrade(w io.Writer, cr *bufio.Reader, scheme, host, target string, rr *rawRequest, txn *Transaction, cfg Config) bool {
+func (s *Server) handleUpgrade(w io.Writer, cr *bufio.Reader, rt route, scheme, host, target string, rr *rawRequest, txn *Transaction, cfg Config) bool {
 	start := time.Now()
 	fail := func(err error) bool {
 		txn.Status = 502
@@ -53,16 +51,15 @@ func (s *Server) handleUpgrade(w io.Writer, cr *bufio.Reader, scheme, host, targ
 	hostname = strings.Trim(hostname, "[]")
 	dialAddr := net.JoinHostPort(hostname, port)
 
-	upURL, desc := s.upstreamInfo()
+	txn.Profile, txn.ProfileAuto, txn.Upstream = rt.profile.ID, rt.auto, rt.upstreamName()
 	var raw net.Conn
 	var err error
-	if upURL != "" && !isLoopbackHost(hostname) {
-		raw, err = dialVia(upURL, dialAddr)
+	if rt.up != nil && !isLoopbackHost(hostname) {
+		raw, err = dialVia(rt.up.URL, dialAddr)
 	} else {
 		raw, err = net.DialTimeout("tcp", dialAddr, 15*time.Second)
-		desc = "direct"
+		txn.Upstream = "direct"
 	}
-	txn.Upstream = desc
 	txn.Attempts = 1
 	if err != nil {
 		return fail(err)
@@ -71,7 +68,7 @@ func (s *Server) handleUpgrade(w io.Writer, cr *bufio.Reader, scheme, host, targ
 
 	conn := raw
 	if scheme == "https" {
-		uc, err := fp.WebSocketClient(raw, hostname)
+		uc, err := rt.profile.WebSocketClient(raw, hostname)
 		if err != nil {
 			return fail(err)
 		}
@@ -102,7 +99,7 @@ func (s *Server) handleUpgrade(w io.Writer, cr *bufio.Reader, scheme, host, targ
 		}
 		v := h.Value
 		if ln == "user-agent" && cfg.ForceUA {
-			v = fp.UserAgent
+			v = rt.profile.UserAgent
 		}
 		fmt.Fprintf(&b, "%s: %s\r\n", h.Name, v)
 	}

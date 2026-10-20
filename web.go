@@ -4,27 +4,22 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"net"
 	stdhttp "net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 
+	fhttp "github.com/bogdanfinn/fhttp"
+
 	"github.com/mosphox/netlog/internal/fp"
 )
 
-//go:embed web/index.html
+//go:embed web
 var webFS embed.FS
-
-// fingerprint constants surfaced in the UI so the operator can confirm at a
-// glance what netlog presents upstream.
-const (
-	targetJA4    = "t13d1517h2_8daaf6152771_3cbfd9057e0d"
-	targetJA3    = "9d42e90b0225e779f03141ddcd699df2"
-	targetAkamai = "6ea73faa8fc5aac76bded7bd238f6433"
-	targetAkText = "1:65536;2:0;4:131072;5:16384|12517377|0|m,p,a,s"
-)
 
 // inlineCap bounds how many body bytes are sent to the browser for inline
 // display. The full body is always available via the download endpoint.
@@ -32,20 +27,27 @@ const inlineCap = 2 << 20 // 2 MiB
 
 type webServer struct {
 	srv     *Server
-	caPath  string // where the CA .pem was exported (Desktop)
+	caPath  string // where the CA .pem was exported
 	dataDir string
 }
 
 func (ws *webServer) routes() *stdhttp.ServeMux {
 	mux := stdhttp.NewServeMux()
-	mux.HandleFunc("GET /", ws.handleIndex)
+	static, _ := fs.Sub(webFS, "web")
+	mux.Handle("GET /", stdhttp.FileServerFS(static))
 	mux.HandleFunc("GET /api/status", ws.handleStatus)
 	mux.HandleFunc("GET /api/config", ws.handleGetConfig)
 	mux.HandleFunc("POST /api/config", ws.handleSetConfig)
+	mux.HandleFunc("GET /api/fingerprints", ws.handleFingerprints)
+	mux.HandleFunc("POST /api/upstreams/test", ws.handleTestUpstream)
 	mux.HandleFunc("GET /api/logs", ws.handleList)
 	mux.HandleFunc("GET /api/logs/{id}", ws.handleDetail)
 	mux.HandleFunc("GET /api/logs/{id}/body", ws.handleBody)
 	mux.HandleFunc("POST /api/logs/{id}/replay", ws.handleReplay)
+	mux.HandleFunc("POST /api/send", ws.handleSend)
+	mux.HandleFunc("GET /api/intercept", ws.handleInterceptList)
+	mux.HandleFunc("POST /api/intercept/{id}", ws.handleInterceptDecide)
+	mux.HandleFunc("POST /api/intercept/forward-all", ws.handleInterceptForwardAll)
 	mux.HandleFunc("POST /api/clear", ws.handleClear)
 	mux.HandleFunc("GET /api/har", ws.handleHAR)
 	mux.HandleFunc("GET /ca.pem", ws.handleCA)
@@ -67,35 +69,26 @@ func (ws *webServer) handleHAR(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 	w.Write(data)
 }
 
-func (ws *webServer) handleIndex(w stdhttp.ResponseWriter, r *stdhttp.Request) {
-	data, err := webFS.ReadFile("web/index.html")
-	if err != nil {
-		stdhttp.Error(w, err.Error(), 500)
-		return
-	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write(data)
-}
-
 func (ws *webServer) handleStatus(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 	cfg := ws.srv.cfgStore.get()
-	_, upDesc := ws.srv.upstreamInfo()
+	var active any
+	if u := cfg.upstream(cfg.ActiveUpstream); u != nil {
+		active = map[string]any{"id": u.ID, "name": u.Name, "url": redactURL(u.URL)}
+	}
 	writeJSON(w, map[string]any{
-		"proxy_port":   ws.srv.currentPort(),
-		"upstream":     upDesc,
-		"mitm":         cfg.MITMEnabled,
-		"force_ua":     cfg.ForceUA,
-		"user_agent":   fp.UserAgent,
-		"ja4":          targetJA4,
-		"ja3_hash":     targetJA3,
-		"akamai_hash":  targetAkamai,
-		"akamai_text":  targetAkText,
-		"count":        ws.srv.logs.count(),
-		"max_id":       ws.srv.logs.maxID(),
-		"upstream_url": cfg.UpstreamURL,
-		"listening":    ws.srv.currentPort() != 0,
-		"ca_path":      ws.caPath,
-		"data_dir":     ws.dataDir,
+		"proxy_port":     ws.srv.currentPort(),
+		"listening":      ws.srv.currentPort() != 0,
+		"upstream":       active,
+		"mitm":           cfg.MITMEnabled,
+		"force_ua":       cfg.ForceUA,
+		"fingerprint":    cfg.Fingerprint,
+		"fallback":       cfg.FallbackFingerprint,
+		"intercept":      cfg.Intercept,
+		"intercept_held": len(ws.srv.intercept.list()),
+		"count":          ws.srv.logs.count(),
+		"max_id":         ws.srv.logs.maxID(),
+		"ca_path":        ws.caPath,
+		"data_dir":       ws.dataDir,
 	})
 }
 
@@ -104,25 +97,67 @@ func (ws *webServer) handleGetConfig(w stdhttp.ResponseWriter, r *stdhttp.Reques
 }
 
 func (ws *webServer) handleSetConfig(w stdhttp.ResponseWriter, r *stdhttp.Request) {
-	var in Config
+	in := ws.srv.cfgStore.get()
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		writeJSON(w, map[string]any{"ok": false, "error": "bad json: " + err.Error()})
 		return
 	}
-	if in.ListenPort < 1 || in.ListenPort > 65535 {
-		writeJSON(w, map[string]any{"ok": false, "error": "listen port out of range"})
-		return
-	}
-	if u := strings.TrimSpace(in.UpstreamURL); u != "" {
-		if !strings.Contains(u, "://") {
-			in.UpstreamURL = "http://" + u
-		}
-	}
 	if err := ws.srv.ApplyConfig(in); err != nil {
-		writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
+		writeJSON(w, map[string]any{"ok": false, "error": err.Error(), "config": ws.srv.cfgStore.get()})
 		return
 	}
 	writeJSON(w, map[string]any{"ok": true, "config": ws.srv.cfgStore.get(), "proxy_port": ws.srv.currentPort()})
+}
+
+func (ws *webServer) handleFingerprints(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+	writeJSON(w, map[string]any{"profiles": fp.All(), "default": fp.Default.ID})
+}
+
+// handleTestUpstream sends one request through an upstream to an IP-info
+// service and reports the exit IP, location and round-trip time.
+func (ws *webServer) handleTestUpstream(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+	var in struct {
+		URL string `json:"url"`
+	}
+	json.NewDecoder(r.Body).Decode(&in)
+	upURL := strings.TrimSpace(in.URL)
+	if upURL != "" {
+		if !strings.Contains(upURL, "://") {
+			upURL = "http://" + upURL
+		}
+		if err := (Upstream{Name: "test", URL: upURL}).validate(); err != nil {
+			writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+	}
+	client, err := newClient(fp.Default, upURL, false)
+	if err != nil {
+		writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	defer client.CloseIdleConnections()
+	req, _ := fhttp.NewRequest("GET", "https://ipinfo.io/json", nil)
+	req.Header = fhttp.Header{"user-agent": {fp.Default.UserAgent}, "accept": {"application/json"}, fhttp.HeaderOrderKey: {"user-agent", "accept"}}
+	start := time.Now()
+	resp, err := client.Do(req)
+	if err != nil {
+		writeJSON(w, map[string]any{"ok": false, "error": err.Error(), "ms": time.Since(start).Milliseconds()})
+		return
+	}
+	defer resp.Body.Close()
+	var info map[string]any
+	json.NewDecoder(resp.Body).Decode(&info)
+	writeJSON(w, map[string]any{"ok": resp.StatusCode == 200, "status": resp.StatusCode, "ms": time.Since(start).Milliseconds(),
+		"ip": info["ip"], "country": info["country"], "city": info["city"], "org": info["org"]})
+}
+
+func redactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.User == nil {
+		return raw
+	}
+	u.User = url.User(u.User.Username())
+	return u.String()
 }
 
 func (ws *webServer) handleList(w stdhttp.ResponseWriter, r *stdhttp.Request) {
@@ -142,6 +177,7 @@ func (ws *webServer) handleList(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 			"status": e.Status, "req_len": e.ReqLen, "resp_len": e.RespLen,
 			"duration_ms": e.DurationMs, "err": e.Err, "client": e.ClientAddr,
 			"attempts": e.Attempts, "ws": e.WS, "ws_count": e.WSCount, "ct": e.CT,
+			"source": e.Source, "profile": e.Profile, "intercepted": e.Intercepted,
 		})
 	}
 	writeJSON(w, map[string]any{"max_id": maxID, "entries": out})
@@ -179,6 +215,7 @@ func detailView(t *Transaction) map[string]any {
 		"resp_body":   bodyView(t.RespHeaders, t.RespBody),
 		"duration_ms": t.DurationMs, "err": t.Err, "attempts": t.Attempts,
 		"ws_open": t.WSOpen, "ws_messages": msgs,
+		"source": t.Source, "profile": t.Profile, "profile_auto": t.ProfileAuto, "intercepted": t.Intercepted,
 	}
 }
 
@@ -196,6 +233,61 @@ func (ws *webServer) handleReplay(w stdhttp.ResponseWriter, r *stdhttp.Request) 
 		return
 	}
 	writeJSON(w, map[string]any{"ok": true, "id": nt.ID, "status": nt.Status, "err": nt.Err})
+}
+
+// handleSend performs a hand-built request (the repeater) and returns it in
+// full.
+func (ws *webServer) handleSend(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+	var in sendRequest
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeJSON(w, map[string]any{"ok": false, "error": "bad json: " + err.Error()})
+		return
+	}
+	t, err := ws.srv.Send(in, "repeater")
+	if err != nil {
+		writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "txn": detailView(t)})
+}
+
+func (ws *webServer) handleInterceptList(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+	held := ws.srv.intercept.list()
+	out := make([]map[string]any, 0, len(held))
+	for _, h := range held {
+		out = append(out, map[string]any{"id": h.ID, "time": h.Time.Format(time.RFC3339Nano), "client": h.Client,
+			"method": h.Method, "url": h.URL, "headers": h.Headers, "body": h.Body, "body_text": utf8.Valid(h.Body)})
+	}
+	cfg := ws.srv.cfgStore.get()
+	writeJSON(w, map[string]any{"enabled": cfg.Intercept.Enabled, "filter": cfg.Intercept.Filter, "held": out})
+}
+
+func (ws *webServer) handleInterceptDecide(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	var in struct {
+		Action string       `json:"action"` // "forward" or "drop"
+		Edit   *sendRequest `json:"edit"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeJSON(w, map[string]any{"ok": false, "error": "bad json: " + err.Error()})
+		return
+	}
+	if in.Edit != nil {
+		if err := applyEdit(&Transaction{}, in.Edit); err != nil {
+			writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+	}
+	if !ws.srv.intercept.decide(id, interceptDecision{drop: in.Action == "drop", edit: in.Edit}) {
+		writeJSON(w, map[string]any{"ok": false, "error": "that request is no longer held"})
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+func (ws *webServer) handleInterceptForwardAll(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+	ws.srv.intercept.forwardAll()
+	writeJSON(w, map[string]any{"ok": true})
 }
 
 // handleBody streams a full body for download/viewing. side=req|resp,

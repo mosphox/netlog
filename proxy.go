@@ -134,26 +134,46 @@ func (s *Server) handleConnect(conn net.Conn, br *bufio.Reader, rr *rawRequest, 
 	}
 }
 
-// doAndRelay forwards one request upstream with the Firefox fingerprint, logs
+// doAndRelay forwards one request upstream with the chosen fingerprint, logs
 // the full exchange, and relays the response to the client. It returns whether
 // the client connection should be kept alive.
 func (s *Server) doAndRelay(w io.Writer, cr *bufio.Reader, scheme, host, target string, rr *rawRequest, clientAddr string) bool {
 	cfg := s.cfgStore.get()
-	_, upDesc := s.upstreamInfo()
-	fullURL := scheme + "://" + host + target
 	keepAlive := wantsKeepAlive(rr)
-
 	txn := &Transaction{
-		Time: time.Now(), ClientAddr: clientAddr, Scheme: scheme,
-		Method: rr.Method, Host: host, URL: fullURL, Upstream: upDesc,
+		Time: time.Now(), ClientAddr: clientAddr, Source: "proxy", Scheme: scheme,
+		Method: rr.Method, Host: host, URL: scheme + "://" + host + target,
 		ReqProto: rr.Proto, ReqHeaders: rr.Headers, ReqBody: rr.Body,
 	}
 
 	if hasUpgrade(rr) {
-		return s.handleUpgrade(w, cr, scheme, host, target, rr, txn, cfg)
+		rt := resolveRoute(cfg, headerValue(rr.Headers, "user-agent"), routeOverride{})
+		return s.handleUpgrade(w, cr, rt, scheme, host, target, rr, txn, cfg)
 	}
 
-	s.exchange(txn, scheme, host, rr, cfg)
+	if cfg.Intercept.Enabled && interceptMatches(cfg.Intercept.Filter, host) {
+		d := s.intercept.hold(txn)
+		if d.drop {
+			txn.Status, txn.Err, txn.Intercepted = 403, "dropped in intercept", "dropped"
+			s.logs.add(txn)
+			writeSimple(w, 403, "netlog: request dropped in intercept")
+			return false
+		}
+		txn.Intercepted = "forwarded"
+		if d.edit != nil {
+			if err := applyEdit(txn, d.edit); err != nil {
+				txn.Status, txn.Err = 400, "intercept edit: "+err.Error()
+				s.logs.add(txn)
+				writeSimple(w, 400, "netlog: "+txn.Err)
+				return false
+			}
+			txn.Intercepted = "edited"
+			rr = &rawRequest{Method: txn.Method, Proto: rr.Proto, Headers: txn.ReqHeaders, Body: txn.ReqBody}
+		}
+	}
+
+	rt := resolveRoute(cfg, headerValue(rr.Headers, "user-agent"), routeOverride{})
+	s.exchange(txn, rt, rr, cfg)
 	if txn.Err != "" {
 		writeSimple(w, 502, "netlog upstream error: "+txn.Err)
 		return false
@@ -164,11 +184,12 @@ func (s *Server) doAndRelay(w io.Writer, cr *bufio.Reader, scheme, host, target 
 	return keepAlive
 }
 
-// exchange performs one request upstream (with retries), fills in the
-// response side of txn, and logs it. A failure is recorded as status 502 with
-// txn.Err set.
-func (s *Server) exchange(txn *Transaction, scheme, host string, rr *rawRequest, cfg Config) {
-	fullURL := txn.URL
+// exchange performs one request upstream (with retries) on a route, fills in
+// the response side of txn, and logs it. txn.URL, Scheme and Host say where it
+// goes. A failure is recorded as status 502 with txn.Err set.
+func (s *Server) exchange(txn *Transaction, rt route, rr *rawRequest, cfg Config) {
+	txn.Profile, txn.ProfileAuto, txn.Upstream = rt.profile.ID, rt.auto, rt.upstreamName()
+	host := txn.Host
 	start := time.Now()
 	var (
 		statusCode  int
@@ -178,7 +199,7 @@ func (s *Server) exchange(txn *Transaction, scheme, host string, rr *rawRequest,
 		doErr       error
 	)
 
-	if scheme == "https" {
+	if txn.Scheme == "https" {
 		// A request that dies on a dead or confused connection is replayed on a
 		// fresh one, as browsers do. Non-idempotent methods get one replay;
 		// the body is fully buffered so replaying is exact.
@@ -188,15 +209,14 @@ func (s *Server) exchange(txn *Transaction, scheme, host string, rr *rawRequest,
 		}
 		for attempt := 1; attempt <= maxAttempts; attempt++ {
 			txn.Attempts = attempt
-			pc, desc, err := s.acquire(host)
+			pc, err := s.acquire(rt, host)
 			if err != nil {
 				doErr = err
 				break
 			}
-			txn.Upstream = desc
-			req, err := buildUpstreamRequest(rr, fullURL, host, cfg)
+			req, err := buildUpstreamRequest(rr, txn.URL, host, rt.profile, cfg)
 			if err != nil {
-				s.release(host, pc, "")
+				s.release(rt, host, pc, "")
 				doErr = err
 				break
 			}
@@ -204,7 +224,7 @@ func (s *Server) exchange(txn *Transaction, scheme, host string, rr *rawRequest,
 			if rerr == nil {
 				respBody, rerr = io.ReadAll(resp.Body)
 				resp.Body.Close()
-				s.release(host, pc, resp.Proto)
+				s.release(rt, host, pc, resp.Proto)
 				if rerr == nil {
 					doErr = nil
 					statusCode = resp.StatusCode
@@ -213,17 +233,17 @@ func (s *Server) exchange(txn *Transaction, scheme, host string, rr *rawRequest,
 					break
 				}
 			} else {
-				s.release(host, pc, "")
+				s.release(rt, host, pc, "")
 			}
 			doErr = rerr
 			if !retryable(rerr) {
 				break
 			}
-			s.discard(host, pc)
+			s.discard(rt, host, pc)
 		}
 	} else {
 		// Cleartext http:// via the standard proxied client.
-		statusCode, respHeaders, respBody, doErr = s.doPlain(rr.Method, fullURL, rr, cfg)
+		statusCode, respHeaders, respBody, doErr = s.doPlain(rt, rr.Method, txn.URL, rr, cfg)
 		respProto = "HTTP/1.1"
 	}
 
@@ -240,30 +260,75 @@ func (s *Server) exchange(txn *Transaction, scheme, host string, rr *rawRequest,
 	s.logs.add(txn)
 }
 
-// Replay re-sends a logged request through the same upstream path and logs
-// the result as a new transaction. Websocket handshakes cannot be replayed.
-func (s *Server) Replay(orig *Transaction) (*Transaction, error) {
-	u, err := url.Parse(orig.URL)
-	if err != nil {
+// sendRequest is a request built by hand (repeater) or replayed from the log.
+type sendRequest struct {
+	Method  string     `json:"method"`
+	URL     string     `json:"url"`
+	Headers []HeaderKV `json:"headers"`
+	Body    []byte     `json:"body"` // base64 in JSON
+	routeOverride
+}
+
+// Send performs a hand-built request and logs it with the given source
+// ("repeater", "replay of #12").
+func (s *Server) Send(sr sendRequest, source string) (*Transaction, error) {
+	txn := &Transaction{Time: time.Now(), ClientAddr: "netlog", Source: source, ReqProto: "HTTP/1.1"}
+	if err := applyEdit(txn, &sr); err != nil {
 		return nil, err
 	}
-	rr := &rawRequest{Method: orig.Method, Target: u.RequestURI(), Proto: orig.ReqProto, Headers: orig.ReqHeaders, Body: orig.ReqBody}
+	rr := &rawRequest{Method: txn.Method, Target: "", Proto: txn.ReqProto, Headers: txn.ReqHeaders, Body: txn.ReqBody}
 	if hasUpgrade(rr) {
-		return nil, errors.New("websocket handshakes cannot be replayed")
+		return nil, errors.New("websocket handshakes cannot be sent from here")
 	}
-	_, upDesc := s.upstreamInfo()
-	txn := &Transaction{
-		Time: time.Now(), ClientAddr: "replay of #" + strconv.FormatInt(orig.ID, 10), Scheme: orig.Scheme,
-		Method: rr.Method, Host: orig.Host, URL: orig.URL, Upstream: upDesc,
-		ReqProto: rr.Proto, ReqHeaders: rr.Headers, ReqBody: rr.Body,
+	cfg := s.cfgStore.get()
+	if sr.Upstream != "" && sr.Upstream != "direct" && cfg.upstream(sr.Upstream) == nil {
+		return nil, fmt.Errorf("unknown upstream %q", sr.Upstream)
 	}
-	s.exchange(txn, orig.Scheme, orig.Host, rr, s.cfgStore.get())
+	if sr.Profile != "" && sr.Profile != "auto" {
+		if _, ok := fp.Lookup(sr.Profile); !ok {
+			return nil, fmt.Errorf("unknown fingerprint %q", sr.Profile)
+		}
+	}
+	rt := resolveRoute(cfg, headerValue(txn.ReqHeaders, "user-agent"), sr.routeOverride)
+	s.exchange(txn, rt, rr, cfg)
 	return txn, nil
 }
 
+// Replay re-sends a logged request unchanged on the current route.
+func (s *Server) Replay(orig *Transaction) (*Transaction, error) {
+	return s.Send(sendRequest{Method: orig.Method, URL: orig.URL, Headers: orig.ReqHeaders, Body: orig.ReqBody}, "replay of #"+strconv.FormatInt(orig.ID, 10))
+}
+
+// applyEdit points txn at a (possibly edited) request: method, absolute URL,
+// headers and body.
+func applyEdit(txn *Transaction, e *sendRequest) error {
+	method := strings.ToUpper(strings.TrimSpace(e.Method))
+	if method == "" || strings.ContainsAny(method, " \t\r\n") {
+		return fmt.Errorf("bad method %q", e.Method)
+	}
+	u, err := url.Parse(strings.TrimSpace(e.URL))
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return fmt.Errorf("the URL must be absolute http:// or https://, got %q", e.URL)
+	}
+	for _, h := range e.Headers {
+		if h.Name == "" || strings.ContainsAny(h.Name, " :\r\n") || strings.ContainsAny(h.Value, "\r\n") {
+			return fmt.Errorf("bad header %q", h.Name)
+		}
+	}
+	txn.Method = method
+	txn.Scheme = u.Scheme
+	txn.Host = urlAuthority(u.Host, u.Scheme)
+	u.Host = txn.Host
+	txn.URL = u.String()
+	txn.ReqHeaders = e.Headers
+	txn.ReqBody = e.Body
+	return nil
+}
+
 // buildUpstreamRequest turns the client's request into the upstream HTTP/2
-// request: lowercase names, original order, Firefox's "te: trailers".
-func buildUpstreamRequest(rr *rawRequest, fullURL, host string, cfg Config) (*http.Request, error) {
+// request: lowercase names in the original order, the profile's UA when
+// forced, and "te: trailers" for profiles that send it (Firefox).
+func buildUpstreamRequest(rr *rawRequest, fullURL, host string, p *fp.Profile, cfg Config) (*http.Request, error) {
 	var body io.Reader
 	if len(rr.Body) > 0 {
 		body = bytes.NewReader(rr.Body)
@@ -274,7 +339,7 @@ func buildUpstreamRequest(rr *rawRequest, fullURL, host string, cfg Config) (*ht
 	}
 	req.Header = http.Header{}
 	order := make([]string, 0, len(rr.Headers)+1)
-	haveTE := false
+	haveTE, haveUA := false, false
 	for _, h := range rr.Headers {
 		ln := strings.ToLower(h.Name)
 		// Skip connection-scoped headers, Host (derived from URL), and
@@ -283,24 +348,35 @@ func buildUpstreamRequest(rr *rawRequest, fullURL, host string, cfg Config) (*ht
 		if hopByHop[ln] || ln == "host" || ln == "content-length" {
 			continue
 		}
-		if ln == "user-agent" && cfg.ForceUA {
-			continue
-		}
-		if ln == "te" {
+		v := h.Value
+		switch ln {
+		case "user-agent":
+			if cfg.ForceUA {
+				if haveUA {
+					continue
+				}
+				v = p.UserAgent
+			}
+			haveUA = true
+		case "te":
+			if !p.AddTE {
+				continue // only "trailers" is legal on h2, and only Firefox sends it
+			}
 			haveTE = true
 		}
-		// HTTP/2 header names must be lowercase; real Firefox sends them
-		// lowercase too. Use the lowercased name as the key (and never
-		// Header.Set, which would Title-Case it).
-		req.Header[ln] = append(req.Header[ln], h.Value)
-		order = append(order, ln)
+		// HTTP/2 header names must be lowercase, and browsers send them so.
+		// Use the lowercased name as the key (never Header.Set, which would
+		// Title-Case it).
+		if _, seen := req.Header[ln]; !seen {
+			order = append(order, ln)
+		}
+		req.Header[ln] = append(req.Header[ln], v)
 	}
-	if cfg.ForceUA {
-		req.Header["user-agent"] = []string{fp.UserAgent}
+	if cfg.ForceUA && !haveUA {
+		req.Header["user-agent"] = []string{p.UserAgent}
 		order = append(order, "user-agent")
 	}
-	// Firefox always sends "te: trailers" on h2; add it if the client (on h1) didn't.
-	if !haveTE {
+	if p.AddTE && !haveTE {
 		req.Header["te"] = []string{"trailers"}
 		order = append(order, "te")
 	}

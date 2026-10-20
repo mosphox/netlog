@@ -21,10 +21,71 @@ import (
 // connections are closed and it is forgotten.
 const hostClientIdle = 3 * time.Minute
 
-// h1ConnsPerHost mirrors Firefox's limit of parallel HTTP/1.1 connections per
-// host (network.http.max-persistent-connections-per-server). An HTTP/2 host
-// gets a single connection, as in Firefox.
+// h1ConnsPerHost mirrors the browsers' limit of parallel HTTP/1.1 connections
+// per host (6 in both Firefox and Chrome). An HTTP/2 host gets a single
+// connection, as in the browsers.
 const h1ConnsPerHost = 6
+
+// upstreamTimeout bounds one upstream request, body included.
+const upstreamTimeout = 90 * time.Second
+
+// route is how one request leaves netlog: which fingerprint it presents and
+// which upstream proxy it goes through (nil = direct).
+type route struct {
+	profile *fp.Profile
+	up      *Upstream
+	auto    bool // profile was picked from the client's User-Agent
+}
+
+func (r route) upstreamURL() string {
+	if r.up == nil {
+		return ""
+	}
+	return r.up.URL
+}
+
+func (r route) upstreamName() string {
+	if r.up == nil {
+		return "direct"
+	}
+	return r.up.Name
+}
+
+// routeOverride lets the repeater pin a profile or upstream for one request.
+// Empty fields fall back to the config; Upstream "direct" forces no upstream.
+type routeOverride struct {
+	Profile  string `json:"profile"`
+	Upstream string `json:"upstream"`
+}
+
+// resolveRoute picks the profile and upstream for a request.
+func resolveRoute(cfg Config, userAgent string, ov routeOverride) route {
+	var r route
+	switch {
+	case ov.Profile != "" && ov.Profile != "auto":
+		r.profile, _ = fp.Lookup(ov.Profile)
+	case ov.Profile == "auto" || cfg.Fingerprint == "auto":
+		if p, ok := fp.Detect(userAgent); ok {
+			r.profile, r.auto = p, true
+		}
+	default:
+		r.profile, _ = fp.Lookup(cfg.Fingerprint)
+	}
+	if r.profile == nil {
+		r.profile, _ = fp.Lookup(cfg.FallbackFingerprint)
+	}
+	if r.profile == nil {
+		r.profile = fp.Default
+	}
+	switch ov.Upstream {
+	case "":
+		r.up = cfg.upstream(cfg.ActiveUpstream)
+	case "direct":
+	default:
+		r.up = cfg.upstream(ov.Upstream)
+	}
+	return r
+}
 
 // pooledClient is one fingerprinted client inside a host pool.
 type pooledClient struct {
@@ -32,114 +93,78 @@ type pooledClient struct {
 	inflight int // guarded by Server.mu
 }
 
-// hostPool holds the clients dedicated to one upstream authority. tls-client
+// hostPool holds the clients for one (profile, upstream, authority). tls-client
 // holds a client-wide lock across each upstream dial and TLS handshake, so
 // sharing a client between hosts lets one slow host stall every other; and
 // within an HTTP/1.1 host, parallel requests need parallel dials, which one
 // client would serialize. Hence: clients per host, several for h1 hosts.
 type hostPool struct {
-	clients  []*pooledClient
-	h1       bool // the host answered over HTTP/1.1, so it may use several connections
-	lastUsed time.Time
-	loopback bool
+	profile     *fp.Profile
+	upstreamURL string
+	clients     []*pooledClient
+	h1          bool // the host answered over HTTP/1.1, so it may use several connections
+	lastUsed    time.Time
+	loopback    bool
 }
 
-// Server owns the proxy listener, the fingerprinted upstream clients, the CA
-// and the log store. Clients and the listener are rebuilt when config changes
-// from the web UI.
+// Server owns the proxy listener, the fingerprinted upstream clients, the CA,
+// the log store and the interception queue.
 type Server struct {
-	cfgStore *configStore
-	ca       *certAuthority
-	logs     *logStore
+	cfgStore  *configStore
+	ca        *certAuthority
+	logs      *logStore
+	intercept *interceptQueue
 
-	mu           sync.Mutex
-	hosts        map[string]*hostPool // authority -> fingerprinted clients, for https
-	upstreamURL  string               // "" = direct
-	stdClient    *stdhttp.Client      // plain, for cleartext http:// (no TLS fingerprint applies)
-	upstreamDesc string
-	ln           net.Listener
-	curPort      int
+	mu         sync.Mutex
+	hosts      map[string]*hostPool       // poolKey -> fingerprinted clients, for https
+	stdClients map[string]*stdhttp.Client // upstream URL -> plain client, for cleartext http://
+	ln         net.Listener
+	curPort    int
 }
 
 func NewServer(cfgStore *configStore, ca *certAuthority, logs *logStore) (*Server, error) {
-	s := &Server{cfgStore: cfgStore, ca: ca, logs: logs}
-	if err := s.rebuildClient(cfgStore.get()); err != nil {
-		return nil, err
-	}
+	s := &Server{cfgStore: cfgStore, ca: ca, logs: logs, intercept: newInterceptQueue(),
+		hosts: make(map[string]*hostPool), stdClients: make(map[string]*stdhttp.Client)}
 	go s.reapIdleClients()
 	return s, nil
 }
 
-// rebuildClient drops every per-host client (they are recreated on demand
-// with the new upstream) and rebuilds the plain-http client.
-func (s *Server) rebuildClient(cfg Config) error {
-	up := strings.TrimSpace(cfg.UpstreamURL)
-	if up != "" {
-		if _, err := url.Parse(up); err != nil {
-			return fmt.Errorf("bad upstream url: %w", err)
-		}
-	}
-	desc := nonEmpty(up, "direct")
-
-	// Plain cleartext-http client, proxied the same way but without any TLS
-	// fingerprinting (there is no TLS layer to fingerprint on http://).
-	tr := &stdhttp.Transport{DisableCompression: true, TLSHandshakeTimeout: 15 * time.Second, IdleConnTimeout: 30 * time.Second}
-	if up != "" {
-		if pu, perr := url.Parse(up); perr == nil {
-			proxyURL := stdhttp.ProxyURL(pu)
-			tr.Proxy = func(r *stdhttp.Request) (*url.URL, error) {
-				if isLoopbackHost(r.URL.Hostname()) {
-					return nil, nil
-				}
-				return proxyURL(r)
-			}
-		}
-	}
-	std := &stdhttp.Client{
-		Transport:     tr,
-		Timeout:       upstreamTimeout,
-		CheckRedirect: func(*stdhttp.Request, []*stdhttp.Request) error { return stdhttp.ErrUseLastResponse },
-	}
-
+// dropClients forgets every pooled client; they are recreated on demand.
+func (s *Server) dropClients() {
 	s.mu.Lock()
 	old := s.hosts
 	s.hosts = make(map[string]*hostPool)
-	s.upstreamURL = up
-	s.stdClient = std
-	s.upstreamDesc = desc
+	s.stdClients = make(map[string]*stdhttp.Client)
 	s.mu.Unlock()
 	for _, hp := range old {
 		for _, pc := range hp.clients {
 			pc.c.CloseIdleConnections()
 		}
 	}
-	return nil
 }
 
-// upstreamTimeout bounds one upstream request, body included.
-const upstreamTimeout = 90 * time.Second
+func poolKey(rt route, authority string) string {
+	return rt.profile.ID + "|" + rt.upstreamURL() + "|" + authority
+}
 
-// acquire returns a fingerprinted client for an authority and marks it busy;
-// the caller must release it. It picks the least busy client of the host's
+// acquire returns a fingerprinted client for an authority on a route and marks
+// it busy; the caller must release it. It picks the least busy client of the
 // pool and, for HTTP/1.1 hosts, opens another one while all are busy.
 // Loopback targets are dialed directly, never via the upstream.
-func (s *Server) acquire(authority string) (*pooledClient, string, error) {
+func (s *Server) acquire(rt route, authority string) (*pooledClient, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	hp, ok := s.hosts[authority]
+	key := poolKey(rt, authority)
+	hp, ok := s.hosts[key]
 	if !ok {
 		host := authority
 		if h, _, err := net.SplitHostPort(authority); err == nil {
 			host = h
 		}
-		hp = &hostPool{loopback: isLoopbackHost(strings.Trim(host, "[]"))}
-		s.hosts[authority] = hp
+		hp = &hostPool{profile: rt.profile, upstreamURL: rt.upstreamURL(), loopback: isLoopbackHost(strings.Trim(host, "[]"))}
+		s.hosts[key] = hp
 	}
 	hp.lastUsed = time.Now()
-	desc := s.upstreamDesc
-	if hp.loopback {
-		desc = "direct (loopback)"
-	}
 
 	var best *pooledClient
 	for _, pc := range hp.clients {
@@ -148,23 +173,23 @@ func (s *Server) acquire(authority string) (*pooledClient, string, error) {
 		}
 	}
 	if best == nil || (best.inflight > 0 && hp.h1 && len(hp.clients) < h1ConnsPerHost) {
-		c, err := s.newClient(hp.loopback)
+		c, err := newClient(hp.profile, hp.upstreamURL, hp.loopback)
 		if err != nil {
-			return nil, desc, err
+			return nil, err
 		}
 		best = &pooledClient{c: c}
 		hp.clients = append(hp.clients, best)
 	}
 	best.inflight++
-	return best, desc, nil
+	return best, nil
 }
 
 // release marks a client idle again and records the protocol the host spoke.
-func (s *Server) release(authority string, pc *pooledClient, proto string) {
+func (s *Server) release(rt route, authority string, pc *pooledClient, proto string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	pc.inflight--
-	if hp, ok := s.hosts[authority]; ok && strings.HasPrefix(proto, "HTTP/1") {
+	if hp, ok := s.hosts[poolKey(rt, authority)]; ok && strings.HasPrefix(proto, "HTTP/1") {
 		hp.h1 = true
 	}
 }
@@ -172,9 +197,9 @@ func (s *Server) release(authority string, pc *pooledClient, proto string) {
 // discard removes a client after a connection-level failure so the retry
 // dials a fresh connection instead of reusing a dead one. In-flight requests
 // on the old client finish on their own.
-func (s *Server) discard(authority string, pc *pooledClient) {
+func (s *Server) discard(rt route, authority string, pc *pooledClient) {
 	s.mu.Lock()
-	if hp, ok := s.hosts[authority]; ok {
+	if hp, ok := s.hosts[poolKey(rt, authority)]; ok {
 		for i, x := range hp.clients {
 			if x == pc {
 				hp.clients = append(hp.clients[:i:i], hp.clients[i+1:]...)
@@ -186,17 +211,19 @@ func (s *Server) discard(authority string, pc *pooledClient) {
 	pc.c.CloseIdleConnections()
 }
 
-func (s *Server) newClient(loopback bool) (tls_client.HttpClient, error) {
+func newClient(p *fp.Profile, upstreamURL string, loopback bool) (tls_client.HttpClient, error) {
 	idle := 30 * time.Second
-	opts := append(fp.Options(),
-		tls_client.WithCookieJar(nil), // Firefox manages its own cookies
+	opts := append(p.Options(),
+		tls_client.WithCookieJar(nil), // the browser manages its own cookies
 		tls_client.WithDialer(net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}),
 		tls_client.WithTimeoutSeconds(int(upstreamTimeout/time.Second)),
-		// Upstream proxies drop idle tunnels; don't reuse one that sat for long.
+		// Never let the transport decode content: bodies are relayed byte for
+		// byte and decoded only for display. Upstream proxies drop idle
+		// tunnels, so don't reuse one that sat for long.
 		tls_client.WithTransportOptions(&tls_client.TransportOptions{DisableCompression: true, IdleConnTimeout: &idle}),
 	)
-	if s.upstreamURL != "" && !loopback {
-		opts = append(opts, tls_client.WithProxyUrl(s.upstreamURL))
+	if upstreamURL != "" && !loopback {
+		opts = append(opts, tls_client.WithProxyUrl(upstreamURL))
 	}
 	return tls_client.NewHttpClient(tls_client.NewNoopLogger(), opts...)
 }
@@ -225,12 +252,6 @@ func (s *Server) reapIdleClients() {
 	}
 }
 
-func (s *Server) upstreamInfo() (upstreamURL, desc string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.upstreamURL, s.upstreamDesc
-}
-
 func isLoopbackHost(host string) bool {
 	if strings.EqualFold(host, "localhost") || strings.HasSuffix(strings.ToLower(host), ".localhost") {
 		return true
@@ -239,13 +260,39 @@ func isLoopbackHost(host string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-// doPlain forwards a cleartext http:// request through the standard proxied
-// client and returns a normalized response.
-func (s *Server) doPlain(method, fullURL string, rr *rawRequest, cfg Config) (int, []HeaderKV, []byte, error) {
+// plainClient returns the cleartext-http client for an upstream. There is no
+// TLS layer to fingerprint on http://, so this is the standard library.
+func (s *Server) plainClient(upstreamURL string) *stdhttp.Client {
 	s.mu.Lock()
-	client := s.stdClient
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	if c, ok := s.stdClients[upstreamURL]; ok {
+		return c
+	}
+	tr := &stdhttp.Transport{DisableCompression: true, TLSHandshakeTimeout: 15 * time.Second, IdleConnTimeout: 30 * time.Second}
+	if upstreamURL != "" {
+		if pu, err := url.Parse(upstreamURL); err == nil {
+			proxyURL := stdhttp.ProxyURL(pu)
+			tr.Proxy = func(r *stdhttp.Request) (*url.URL, error) {
+				if isLoopbackHost(r.URL.Hostname()) {
+					return nil, nil
+				}
+				return proxyURL(r)
+			}
+		}
+	}
+	c := &stdhttp.Client{
+		Transport:     tr,
+		Timeout:       upstreamTimeout,
+		CheckRedirect: func(*stdhttp.Request, []*stdhttp.Request) error { return stdhttp.ErrUseLastResponse },
+	}
+	s.stdClients[upstreamURL] = c
+	return c
+}
 
+// doPlain forwards a cleartext http:// request and returns a normalized
+// response.
+func (s *Server) doPlain(rt route, method, fullURL string, rr *rawRequest, cfg Config) (int, []HeaderKV, []byte, error) {
+	client := s.plainClient(rt.upstreamURL())
 	var body io.Reader
 	if len(rr.Body) > 0 {
 		body = strings.NewReader(string(rr.Body))
@@ -266,7 +313,7 @@ func (s *Server) doPlain(method, fullURL string, rr *rawRequest, cfg Config) (in
 		req.Header[h.Name] = append(req.Header[h.Name], h.Value)
 	}
 	if cfg.ForceUA {
-		req.Header.Set("User-Agent", fp.UserAgent)
+		req.Header.Set("User-Agent", rt.profile.UserAgent)
 	}
 	req.Host = ""
 
@@ -337,22 +384,32 @@ func (s *Server) currentPort() int {
 	return s.curPort
 }
 
-// ApplyConfig persists new config, rebuilds the upstream client, and rebinds the
-// listener if the port changed. On a failed rebind it restores the old port.
+// ApplyConfig validates and persists new config, drops pooled clients when
+// routing changed, rebinds the listener if the port changed (restoring the
+// old one on failure), and releases held requests when interception is off.
 func (s *Server) ApplyConfig(newCfg Config) error {
+	newCfg.normalize()
+	if err := newCfg.validate(); err != nil {
+		return err
+	}
 	old := s.cfgStore.get()
 	if err := s.cfgStore.set(newCfg); err != nil {
 		return err
 	}
-	if err := s.rebuildClient(newCfg); err != nil {
-		return err
+	if fmt.Sprint(old.Upstreams) != fmt.Sprint(newCfg.Upstreams) {
+		s.dropClients()
+	}
+	if !newCfg.Intercept.Enabled {
+		s.intercept.forwardAll()
 	}
 	if newCfg.ListenPort != old.ListenPort {
 		s.stopProxy()
 		if err := s.startOn(newCfg.ListenPort); err != nil {
-			// roll back to the previous port so the proxy keeps working
+			wanted := newCfg.ListenPort
 			_ = s.startOn(old.ListenPort)
-			return fmt.Errorf("could not bind port %d (%v); kept %d", newCfg.ListenPort, err, old.ListenPort)
+			newCfg.ListenPort = old.ListenPort
+			_ = s.cfgStore.set(newCfg)
+			return fmt.Errorf("could not bind port %d (%v); kept %d", wanted, err, old.ListenPort)
 		}
 	}
 	return nil

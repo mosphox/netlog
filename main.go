@@ -67,12 +67,16 @@ func main() {
 
 	cfg := cfgStore.get()
 	fmt.Println("netlog")
-	fmt.Printf("  proxy       : http://127.0.0.1:%d   (set Firefox HTTP+HTTPS proxy here)\n", cfg.ListenPort)
-	fmt.Printf("  upstream    : %s\n", nonEmpty(cfg.UpstreamURL, "direct"))
+	upName := "direct"
+	if u := cfg.upstream(cfg.ActiveUpstream); u != nil {
+		upName = u.Name + " (" + redactURL(u.URL) + ")"
+	}
+	fmt.Printf("  proxy       : http://127.0.0.1:%d   (set the browser's HTTP+HTTPS proxy here)\n", cfg.ListenPort)
+	fmt.Printf("  upstream    : %s\n", upName)
+	fmt.Printf("  fingerprint : %s (fallback %s)\n", cfg.Fingerprint, cfg.FallbackFingerprint)
 	fmt.Printf("  web UI      : http://%s\n", *webAddr)
 	fmt.Printf("  data dir    : %s\n", dir)
-	fmt.Printf("  CA cert     : %s   (import into Firefox → Authorities)\n", caPath)
-	fmt.Printf("  fingerprint : JA4 %s | Akamai %s\n", targetJA4, targetAkamai)
+	fmt.Printf("  CA cert     : %s   (trust it in the browser)\n", caPath)
 	fmt.Println()
 
 	ws := &webServer{srv: srv, caPath: caPath, dataDir: dir}
@@ -81,9 +85,3 @@ func main() {
 	}
 }
 
-func nonEmpty(s, fallback string) string {
-	if s == "" {
-		return fallback
-	}
-	return s
-}
