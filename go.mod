@@ -1,4 +1,4 @@
-module netlogger
+module github.com/mosphox/netlog
 
 go 1.26.6
 

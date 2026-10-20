@@ -17,7 +17,7 @@ import (
 
 	http "github.com/bogdanfinn/fhttp"
 
-	"netlogger/internal/fp"
+	"github.com/mosphox/netlog/internal/fp"
 )
 
 // hopByHop headers are connection-scoped and must not be forwarded onto the
@@ -65,7 +65,7 @@ func (s *Server) handlePlain(conn net.Conn, br *bufio.Reader, first *rawRequest,
 	for {
 		u, err := url.Parse(rr.Target)
 		if err != nil || u.Host == "" {
-			writeSimple(conn, 400, "netlogger: bad proxy request target")
+			writeSimple(conn, 400, "netlog: bad proxy request target")
 			return
 		}
 		scheme := u.Scheme
@@ -155,7 +155,7 @@ func (s *Server) doAndRelay(w io.Writer, cr *bufio.Reader, scheme, host, target 
 
 	s.exchange(txn, scheme, host, rr, cfg)
 	if txn.Err != "" {
-		writeSimple(w, 502, "netlogger upstream error: "+txn.Err)
+		writeSimple(w, 502, "netlog upstream error: "+txn.Err)
 		return false
 	}
 	if err := writeResponse(w, txn.Status, txn.RespHeaders, txn.RespBody, keepAlive); err != nil {

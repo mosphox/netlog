@@ -11,14 +11,14 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"netlogger/internal/fp"
+	"github.com/mosphox/netlog/internal/fp"
 )
 
 //go:embed web/index.html
 var webFS embed.FS
 
 // fingerprint constants surfaced in the UI so the operator can confirm at a
-// glance what netlogger presents upstream.
+// glance what netlog presents upstream.
 const (
 	targetJA4    = "t13d1517h2_8daaf6152771_3cbfd9057e0d"
 	targetJA3    = "9d42e90b0225e779f03141ddcd699df2"
@@ -60,7 +60,7 @@ func (ws *webServer) handleHAR(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		stdhttp.Error(w, err.Error(), 500)
 		return
 	}
-	name := "netlogger-" + time.Now().Format("20060102-150405") + ".har"
+	name := "netlog-" + time.Now().Format("20060102-150405") + ".har"
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
 	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
@@ -235,7 +235,7 @@ func (ws *webServer) handleClear(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 
 func (ws *webServer) handleCA(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 	w.Header().Set("Content-Type", "application/x-pem-file")
-	w.Header().Set("Content-Disposition", `attachment; filename="netlogger-ca.pem"`)
+	w.Header().Set("Content-Disposition", `attachment; filename="netlog-ca.pem"`)
 	w.Write(ws.srv.ca.caPEM)
 }
 

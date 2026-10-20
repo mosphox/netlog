@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>netlogger</title>
+<title>netlog</title>
 <style>
   :root{
     --base:#eef1f5; --surface:#ffffff; --sunk:#f6f8fa; --ink:#17202c; --muted:#5d6b7d; --faint:#8a96a6;
@@ -167,7 +167,7 @@
 </head>
 <body>
 <header class="top">
-  <span class="brand">netlogger</span>
+  <span class="brand">netlog</span>
   <span class="state" id="state"><span class="dot" id="dot"></span><span>Proxy <span class="mono" id="proxyaddr">…</span></span><span class="via">via <span class="mono" id="via">…</span></span></span>
   <span class="spacer"></span>
   <button class="btn" id="harbtn" title="Download every request in the list as a HAR 1.2 file">Export HAR</button>
@@ -189,7 +189,7 @@
   <button class="btn" id="live" aria-pressed="true" title="Keep the newest request in view">Live</button>
   <button class="btn" id="clear" title="Empty the list. Logs on disk are kept.">Clear list</button>
 </div>
-<div class="banner" id="banner" role="alert">Can't reach netlogger. Retrying every few seconds.</div>
+<div class="banner" id="banner" role="alert">Can't reach netlog. Retrying every few seconds.</div>
 <main>
   <section class="list" aria-label="Requests">
     <div class="grid head" aria-hidden="true"><span class="t">Time</span><span class="m">Method</span><span>Status</span><span>URL</span><span class="ty">Type</span><span class="sz r">Size</span><span class="r">Time taken</span></div>
@@ -426,7 +426,7 @@ function renderDetail(keepScroll){
   if(d.resp_body.size) f.append(el('span',null, fmtSize(d.resp_body.size)));
   if(d.attempts>1) f.append(el('span',null, `${d.attempts} attempts`));
   const acts=el('span','actions');
-  const rp=el('button','btn','Replay'); rp.title='Send this request again through netlogger'; rp.onclick=replay; rp.disabled = d.status===101;
+  const rp=el('button','btn','Replay'); rp.title='Send this request again through netlog'; rp.onclick=replay; rp.disabled = d.status===101;
   const cc=el('button','btn','Copy as curl'); cc.onclick=()=>copy(curlFor(d),'Copied curl command');
   const cu=el('button','btn','Copy URL'); cu.onclick=()=>copy(d.url,'Copied URL');
   acts.append(rp,cc,cu); f.append(acts);
@@ -548,7 +548,7 @@ async function applyConfig(){
     const r=await (await fetch('/api/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)})).json();
     if(r.ok){ n.className='note ok'; n.textContent='Saved. Proxy listening on 127.0.0.1:'+r.proxy_port+'.'; loadStatus(); }
     else{ n.className='note err'; n.textContent=r.error||'Could not apply settings.'; }
-  }catch(e){ n.className='note err'; n.textContent='Could not reach netlogger.'; }
+  }catch(e){ n.className='note err'; n.textContent='Could not reach netlog.'; }
 }
 ['#port','#upstream','#mitm','#forceua'].forEach(s=>$(s).addEventListener('change',applyConfig));
 $('#harbtn').onclick=()=>{ const a=el('a'); a.href='/api/har'; a.download=''; document.body.append(a); a.click(); a.remove(); toast('Exporting HAR'); };

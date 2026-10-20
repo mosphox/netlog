@@ -15,7 +15,7 @@ import (
 	http "github.com/bogdanfinn/fhttp"
 	tls_client "github.com/bogdanfinn/tls-client"
 
-	"netlogger/internal/fp"
+	"github.com/mosphox/netlog/internal/fp"
 )
 
 func main() {

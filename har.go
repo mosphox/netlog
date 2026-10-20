@@ -136,7 +136,7 @@ func buildHAR(txns []*Transaction) ([]byte, error) {
 	har := map[string]any{
 		"log": map[string]any{
 			"version": "1.2",
-			"creator": map[string]any{"name": "netlogger", "version": "1"},
+			"creator": map[string]any{"name": "netlog", "version": "1"},
 			"entries": entries,
 		},
 	}

@@ -13,7 +13,7 @@ func main() {
 	var (
 		webAddr = flag.String("web", "127.0.0.1:9494", "web UI listen address")
 		dataDir = flag.String("data", "", "data directory (default: <project>/data)")
-		caOut   = flag.String("ca-out", "", "where to export the CA cert (default: ~/Desktop/netlogger-ca.pem)")
+		caOut   = flag.String("ca-out", "", "where to export the CA cert (default: ~/Desktop/netlog-ca.pem)")
 	)
 	flag.Parse()
 
@@ -28,9 +28,9 @@ func main() {
 	}
 	// Mirror the process log (errors, recovered panics) into the data dir so a
 	// failure leaves a trace even when the terminal is gone.
-	if lf, err := os.OpenFile(filepath.Join(dir, "netlogger.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
+	if lf, err := os.OpenFile(filepath.Join(dir, "netlog.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
 		log.SetOutput(io.MultiWriter(os.Stderr, lf))
-		log.Printf("netlogger starting (pid %d)", os.Getpid())
+		log.Printf("netlog starting (pid %d)", os.Getpid())
 	}
 
 	cfgStore, err := newConfigStore(filepath.Join(dir, "config.json"))
@@ -50,7 +50,7 @@ func main() {
 	caPath := *caOut
 	if caPath == "" {
 		home, _ := os.UserHomeDir()
-		caPath = filepath.Join(home, "Desktop", "netlogger-ca.pem")
+		caPath = filepath.Join(home, "Desktop", "netlog-ca.pem")
 	}
 	if err := ca.exportCACert(caPath); err != nil {
 		log.Printf("warning: could not export CA cert to %s: %v", caPath, err)
@@ -66,7 +66,7 @@ func main() {
 	}
 
 	cfg := cfgStore.get()
-	fmt.Println("netlogger")
+	fmt.Println("netlog")
 	fmt.Printf("  proxy       : http://127.0.0.1:%d   (set Firefox HTTP+HTTPS proxy here)\n", cfg.ListenPort)
 	fmt.Printf("  upstream    : %s\n", nonEmpty(cfg.UpstreamURL, "direct"))
 	fmt.Printf("  web UI      : http://%s\n", *webAddr)

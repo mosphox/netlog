@@ -1,4 +1,4 @@
-# netlogger
+# netlog
 
 A local logging/debugging proxy for **your own** traffic — like mitmproxy, but with two
 specific traits:
@@ -20,7 +20,7 @@ specific traits:
    `X25519MLKEM768` key share.
 
 ```
-Firefox ──▶ netlogger :9393 ──(Firefox-158 TLS/H2)──▶ upstream :12345 (LocalRack) ──▶ internet
+Firefox ──▶ netlog :9393 ──(Firefox-158 TLS/H2)──▶ upstream :12345 (LocalRack) ──▶ internet
                 │
                 └── web UI :9494  (config + full request log)
 ```
@@ -28,12 +28,12 @@ Firefox ──▶ netlogger :9393 ──(Firefox-158 TLS/H2)──▶ upstream :
 ## Run
 
 ```bash
-cd ~/projects/local/netlogger
-go build -o netlogger . && ./netlogger
+cd ~/projects/local/netlog
+go build -o netlog . && ./netlog
 ```
 
 Flags: `-web 127.0.0.1:9494` (web UI address), `-data <dir>` (default `./data`),
-`-ca-out <path>` (default `~/Desktop/netlogger-ca.pem`).
+`-ca-out <path>` (default `~/Desktop/netlog-ca.pem`).
 
 On start it prints the proxy port, upstream, web UI URL, data dir and the CA path, and it
 (re)writes the CA certificate to the Desktop.
@@ -43,7 +43,7 @@ On start it prints the proxy port, upstream, web UI URL, data dir and the CA pat
 **1. Trust the CA** (required for HTTPS interception):
 
 - Firefox → Settings → Privacy & Security → Certificates → **View Certificates…**
-- **Authorities** tab → **Import…** → choose `~/Desktop/netlogger-ca.pem`
+- **Authorities** tab → **Import…** → choose `~/Desktop/netlog-ca.pem`
 - Tick **“Trust this CA to identify websites.”** → OK
 
 **2. Point Firefox at the proxy:**
@@ -77,13 +77,13 @@ Then open <http://127.0.0.1:9494> and browse — requests appear live. Visiting
 - **Detail**: Overview (timing, upstream, attempts, query parameters), Request (headers in
   the order sent, cookies, body), Response (headers, Set-Cookie, body with pretty JSON),
   and Messages for websockets (both directions, live while open). **Replay** re-sends the
-  request through netlogger; **Copy as curl** and **Copy URL**.
+  request through netlog; **Copy as curl** and **Copy URL**.
 - Keyboard: `/` filter, `j` / `k` move, `Esc` clears the filter or closes the detail.
 
 ## Data
 
 - `data/config.json` — persisted settings
-- `data/netlogger.log` — process log: errors and any recovered panic with its stack
+- `data/netlog.log` — process log: errors and any recovered panic with its stack
 - `data/ca-cert.pem`, `data/ca-key.pem` — the CA (key is private)
 - `data/logs/YYYY-MM-DD.jsonl` — every transaction, in full, one JSON object per line
   (bodies base64-encoded). This is the untruncated source of truth; the web UI reads from
@@ -96,7 +96,7 @@ Then open <http://127.0.0.1:9494> and browse — requests appear live. Visiting
   applied to the TLS handshake with the **destination**, tunneled through that upstream.
 - **Cleartext `http://`** has no TLS layer to fingerprint; it is forwarded through a plain
   proxied client (still logged in full).
-- **WebSockets** are relayed and logged: netlogger opens its own connection to the origin
+- **WebSockets** are relayed and logged: netlog opens its own connection to the origin
   with the Firefox ClientHello (ALPN `http/1.1` only, as Firefox does for a fresh websocket
   connection), replays the browser's handshake in order, and records every message.
   permessage-deflate is decoded for display. Up to 5000 messages / 32 MB per connection are
@@ -125,7 +125,7 @@ Then open <http://127.0.0.1:9494> and browse — requests appear live. Visiting
 ## Dev
 
 - `third_party/tls-client` is a vendored tls-client v1.16.0 (`replace` in `go.mod`) with two
-  race fixes marked `netlogger patch` in `roundtripper.go`. Upstream could panic
+  race fixes marked `netlog patch` in `roundtripper.go`. Upstream could panic
   ("dialTLS returned no error…") or write its transport map without the lock (a fatal
   concurrent map write) when a host switched between HTTP/1.1 and HTTP/2. Both crashed the
   whole process. Re-check them before upgrading tls-client.

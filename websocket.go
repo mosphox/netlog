@@ -17,7 +17,7 @@ import (
 
 	"golang.org/x/net/proxy"
 
-	"netlogger/internal/fp"
+	"github.com/mosphox/netlog/internal/fp"
 )
 
 // Bounds on what one websocket connection may keep in the log. The connection
@@ -39,7 +39,7 @@ func (s *Server) handleUpgrade(w io.Writer, cr *bufio.Reader, scheme, host, targ
 		txn.Err = err.Error()
 		txn.DurationMs = time.Since(start).Milliseconds()
 		s.logs.add(txn)
-		writeSimple(w, 502, "netlogger upstream error: "+err.Error())
+		writeSimple(w, 502, "netlog upstream error: "+err.Error())
 		return false
 	}
 
@@ -284,7 +284,7 @@ func (r *wsRecorder) snapshot() []WSMessage {
 	out := make([]WSMessage, len(r.msgs), len(r.msgs)+1)
 	copy(out, r.msgs)
 	if r.dropped > 0 {
-		out = append(out, WSMessage{Time: time.Now(), Opcode: -1, Data: []byte(fmt.Sprintf("netlogger: %d more messages not recorded (log cap reached)", r.dropped))})
+		out = append(out, WSMessage{Time: time.Now(), Opcode: -1, Data: []byte(fmt.Sprintf("netlog: %d more messages not recorded (log cap reached)", r.dropped))})
 	}
 	return out
 }

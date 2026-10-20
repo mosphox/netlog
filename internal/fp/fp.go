@@ -1,4 +1,4 @@
-// Package fp defines the exact TLS + HTTP/2 fingerprint that netlogger presents
+// Package fp defines the exact TLS + HTTP/2 fingerprint that netlog presents
 // to upstream, reproducing Firefox 158 on macOS:
 //
 //	ja4        t13d1517h2_8daaf6152771_3cbfd9057e0d
@@ -20,7 +20,7 @@ import (
 	tls "github.com/bogdanfinn/utls"
 )
 
-// UserAgent is the matching Firefox 158 UA string. netlogger forces this header
+// UserAgent is the matching Firefox 158 UA string. netlog forces this header
 // on every upstream request so the HTTP layer agrees with the TLS layer.
 const UserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:158.0) Gecko/20100101 Firefox/158.0"
 
@@ -147,7 +147,7 @@ func Options() []tls_client.HttpClientOption {
 		// internal cache lock, bounded only by this request timeout. Keep it
 		// short so a stalled upstream can't freeze other HTTPS requests for long.
 		tls_client.WithTimeoutSeconds(30),
-		// Never let the transport decode content: netlogger relays bodies byte
+		// Never let the transport decode content: netlog relays bodies byte
 		// for byte (with Content-Encoding intact) and decodes only for display.
 		tls_client.WithTransportOptions(&tls_client.TransportOptions{DisableCompression: true}),
 	}

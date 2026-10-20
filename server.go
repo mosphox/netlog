@@ -14,7 +14,7 @@ import (
 
 	tls_client "github.com/bogdanfinn/tls-client"
 
-	"netlogger/internal/fp"
+	"github.com/mosphox/netlog/internal/fp"
 )
 
 // hostClientIdle is how long an unused host pool is kept before its

@@ -61,8 +61,8 @@ func loadOrCreateCA(dataDir string) (*certAuthority, error) {
 	tmpl := &x509.Certificate{
 		SerialNumber: serial,
 		Subject: pkix.Name{
-			CommonName:   "netlogger local CA",
-			Organization: []string{"netlogger"},
+			CommonName:   "netlog local CA",
+			Organization: []string{"netlog"},
 		},
 		NotBefore:             time.Now().Add(-time.Hour),
 		NotAfter:              time.Now().AddDate(10, 0, 0),
