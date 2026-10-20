@@ -1,135 +1,154 @@
 # netlog
 
-A local logging/debugging proxy for **your own** traffic — like mitmproxy, but with two
-specific traits:
-
-1. It logs **every request and response in full** — request line, all headers (in the exact
-   order sent), query params, and the complete request/response bodies (no truncation on
-   disk). Compressed bodies are relayed byte-for-byte and decompressed only for display.
-2. Every request it makes **to the upstream** reproduces the **Firefox 158 (macOS)**
-   network fingerprint exactly:
-
-   | | value |
-   |---|---|
-   | JA4 | `t13d1517h2_8daaf6152771_3cbfd9057e0d` |
-   | JA3 hash | `9d42e90b0225e779f03141ddcd699df2` |
-   | Akamai H2 | `1:65536;2:0;4:131072;5:16384\|12517377\|0\|m,p,a,s` → `6ea73faa8fc5aac76bded7bd238f6433` |
-
-   This is verified against `tls.peet.ws` / `tls.browserleaks.com` — JA4, JA4_r (raw ordered),
-   JA3 hash and the Akamai hash all match the target exactly, including the post-quantum
-   `X25519MLKEM768` key share.
+A local intercepting proxy for **your own** browser traffic, in the spirit of Burp or
+mitmproxy, with one difference: every request netlog makes upstream carries the **TLS and
+HTTP/2 fingerprint of a real browser**. By default that is the fingerprint of the browser that
+sent the request, so Chrome traffic still looks like Chrome and Firefox traffic like Firefox.
 
 ```
-Firefox ──▶ netlog :9393 ──(Firefox-158 TLS/H2)──▶ upstream :12345 (LocalRack) ──▶ internet
-                │
-                └── web UI :9494  (config + full request log)
+browser ──▶ netlog :9393 ──(Chrome 155 / Firefox 158 TLS + HTTP/2)──▶ [upstream proxy] ──▶ site
+               │
+               └── web UI :9494   proxy history · repeater · intercept · upstreams · fingerprints
 ```
+
+- **Full capture.** Request line, every header in the order it was sent, query, cookies, and
+  complete request and response bodies (compressed bodies are stored as sent and decoded for
+  display). WebSockets are relayed and every message is recorded.
+- **Real fingerprints, checked against the real browsers.** JA4, the raw JA4, peetprint and the
+  Akamai HTTP/2 fingerprint all match captures of the actual browser (see
+  [Fingerprints](#fingerprints)).
+- **Burp-style tools.** Repeater (edit and resend, with a chosen fingerprint and upstream),
+  Intercept (hold, edit, forward or drop), and a list of upstream proxies to switch between.
 
 ## Run
 
+Requires Go 1.26+.
+
 ```bash
-cd ~/projects/local/netlog
 go build -o netlog . && ./netlog
 ```
 
 Flags: `-web 127.0.0.1:9494` (web UI address), `-data <dir>` (default `./data`),
 `-ca-out <path>` (default `~/Desktop/netlog-ca.pem`).
 
-On start it prints the proxy port, upstream, web UI URL, data dir and the CA path, and it
-(re)writes the CA certificate to the Desktop.
+On first start netlog creates a CA in `data/`, exports the public certificate, and listens
+for the browser on `127.0.0.1:9393`. Open <http://127.0.0.1:9494>.
 
-## One-time Firefox setup
+## Set up a browser
 
-**1. Trust the CA** (required for HTTPS interception):
+netlog decrypts HTTPS with its own CA, so the browser you point at it has to trust that CA.
+Trust it only in a browser (or profile) you use for this. The private key stays in
+`data/ca-key.pem`.
 
-- Firefox → Settings → Privacy & Security → Certificates → **View Certificates…**
-- **Authorities** tab → **Import…** → choose `~/Desktop/netlog-ca.pem`
-- Tick **“Trust this CA to identify websites.”** → OK
+**Firefox.** Settings → Privacy & Security → View Certificates → Authorities → Import, choose
+`netlog-ca.pem`, tick "Trust this CA to identify websites". Then Network Settings → Manual proxy:
+HTTP proxy `127.0.0.1`, port `9393`, and "Also use this proxy for HTTPS".
 
-**2. Point Firefox at the proxy:**
+**Chrome.** Add the CA to the macOS keychain as trusted (Keychain Access → System → import,
+set to Always Trust), then start a separate profile pointed at netlog:
 
-- Settings → Network Settings → **Manual proxy configuration**
-- **HTTP Proxy** `127.0.0.1` Port `9393`, and tick **“Also use this proxy for HTTPS”**
-  (older Firefox: set the same under *SSL/HTTPS Proxy*)
-- Clear “No proxy for”, and (recommended) set `network.proxy.allow_hijacking_localhost` if
-  you also want to capture localhost.
+```bash
+open -na "Google Chrome" --args --user-data-dir=/tmp/netlog-chrome --proxy-server=127.0.0.1:9393
+```
 
-Then open <http://127.0.0.1:9494> and browse — requests appear live. Visiting
-`https://tls.browserleaks.com/` through it should report the JA4 above.
+## The web UI
 
-> The CA cert on the Desktop is the **public** certificate — safe to import. The CA
-> **private key** stays in `data/ca-key.pem` and never leaves the machine. Anyone who trusts
-> this CA can have their HTTPS intercepted, so keep the key local and remove the CA from
-> Firefox when you’re done.
+- **Proxy**: live history with a structured filter, status chips, the fingerprint each
+  request went out with, and full detail: headers in order, cookies, bodies (pretty JSON),
+  WebSocket messages. From any request: **Send to Repeater**, **Replay**, **Copy as curl**.
+- **Repeater**: tabs of raw HTTP requests you edit and send. Each tab can pin its own
+  fingerprint and upstream; every send is kept so you can step back through responses.
+  `⌘/Ctrl + Enter` sends.
+- **Intercept**: when on, requests to matching hosts wait before leaving. Edit one and forward
+  it, drop it, or forward everything. The browser waits meanwhile (up to 10 minutes, then the
+  request goes out unchanged).
+- **Upstreams**: the proxies netlog can route through (HTTP, HTTPS, SOCKS5, credentials in the
+  URL). Pick the active one, or test each: exit IP, location, network and latency.
+- **Fingerprints**: Auto or a fixed profile, the fallback for unknown clients, the expected
+  values of every profile, and a live probe that compares a profile with its capture.
+- **Settings**: listen port, HTTPS decryption, CA download, browser setup, HAR export.
 
-## Web UI (`:9494`)
+The top bar shows a 60-second traffic pulse and lets you switch the upstream and the
+fingerprint from anywhere.
 
-- **Top bar**: proxy state (listening port and upstream), **Export HAR**, and **Settings**:
-  listen port, upstream URL (blank = direct), decrypt HTTPS (MITM), force the Firefox UA,
-  the CA download and the fingerprint values. Changes apply immediately.
-- **Filter**: free text matches URL, method, status and error. Structured terms:
-  `host:` `status:` (`404`, `5xx`, `>=400`) `method:` `type:` (`json`, `html`, `js`, `image`…)
-  `path:` and `is:err` `is:ws` `is:retried` `is:replay`. Prefix any term with `-` to exclude.
-  The status chips (2xx … Failed, WebSocket) show counts for the current filter and toggle.
-- **List**: virtualized, so tens of thousands of rows stay smooth. A duration bar (log
-  scale) flags slow requests in amber and failures in red. **Live** keeps the newest row in
-  view; scrolling down pauses it. **Clear list** empties the view; logs on disk stay.
-- **Detail**: Overview (timing, upstream, attempts, query parameters), Request (headers in
-  the order sent, cookies, body), Response (headers, Set-Cookie, body with pretty JSON),
-  and Messages for websockets (both directions, live while open). **Replay** re-sends the
-  request through netlog; **Copy as curl** and **Copy URL**.
-- Keyboard: `/` filter, `j` / `k` move, `Esc` clears the filter or closes the detail.
+Filter syntax in Proxy: free text matches the URL, method, status and error. Terms:
+`host:` `status:` (`404`, `5xx`, `>=400`) `method:` `type:` (`json`, `html`, `js`, `image`…)
+`path:` `fp:` (`chrome`, `firefox_158`) and `is:err` `is:ws` `is:retried` `is:repeater`
+`is:replay` `is:edited`. Prefix any term with `-` to exclude it. Keys: `/` filter, `j`/`k` move,
+`r` send the selected request to Repeater, `Esc` clear.
+
+## Fingerprints
+
+| profile | status | JA4 | Akamai HTTP/2 |
+|---|---|---|---|
+| Chrome 155 (macOS) | verified | `t13d1517h2_8daaf6152771_cb7bf5808d99` | `52d84b11737d980aef856699f885ca86` |
+| Firefox 158 (macOS) | verified | `t13d1517h2_8daaf6152771_3cbfd9057e0d` | `6ea73faa8fc5aac76bded7bd238f6433` |
+| Chrome 152, 146 | tls-client preset | | |
+| Firefox 148, 147 | tls-client preset | | |
+
+"Verified" means the profile was compared with a capture of the real browser on
+[tls.peet.ws](https://tls.peet.ws) and matches on JA4, the raw JA4 (every cipher, extension and
+signature algorithm), the peetprint, the Akamai HTTP/2 fingerprint and the User-Agent. Chrome
+shuffles its extension order on every connection, so its JA3 changes per connection, as it does
+in the real browser. The Chrome profile also carries the details Chrome 155 added: ML-DSA
+signature algorithms, the trust-anchor extension (`0xca34`), and exclusive weight-256 HEADERS
+priority.
+
+In **Auto** mode each request gets the profile of the browser that sent it, picked from its
+User-Agent (same family, nearest version). Anything that is neither Chrome nor Firefox uses the
+fallback profile. **Fixed** sends everything with one profile, and **Rewrite the User-Agent**
+makes the headers agree with it.
+
+Re-check the profiles at any time:
+
+```bash
+go run ./cmd/fpprobe -check                                # exits 1 on any mismatch
+go run ./cmd/fpprobe -check -proxy http://127.0.0.1:12345  # through an upstream
+go run ./cmd/fpprobe -profile chrome_155 -raw              # full reflection JSON
+```
+
+Adding a browser version: capture it on `https://tls.peet.ws/api/all`, add a profile in
+`internal/fp` with the expected values, and run `fpprobe -check`.
 
 ## Data
 
-- `data/config.json` — persisted settings
-- `data/netlog.log` — process log: errors and any recovered panic with its stack
-- `data/ca-cert.pem`, `data/ca-key.pem` — the CA (key is private)
-- `data/logs/YYYY-MM-DD.jsonl` — every transaction, in full, one JSON object per line
-  (bodies base64-encoded). This is the untruncated source of truth; the web UI reads from
-  it on demand.
+- `data/config.json`: settings, including upstreams (file mode 0600, it may hold proxy credentials)
+- `data/ca-cert.pem`, `data/ca-key.pem`: the CA. The key is private.
+- `data/logs/YYYY-MM-DD.jsonl`: every transaction in full, one JSON object per line (bodies
+  base64). The web UI reads from these.
+- `data/netlog.log`: the process log, including any recovered panic.
 
-## Notes / limits
+## Notes and limits
 
-- **Upstream** is treated as an HTTP `CONNECT` proxy (e.g. LocalRack on `:12345`);
-  `socks5://` and credentials in the URL are also accepted. The Firefox fingerprint is
-  applied to the TLS handshake with the **destination**, tunneled through that upstream.
-- **Cleartext `http://`** has no TLS layer to fingerprint; it is forwarded through a plain
-  proxied client (still logged in full).
-- **WebSockets** are relayed and logged: netlog opens its own connection to the origin
-  with the Firefox ClientHello (ALPN `http/1.1` only, as Firefox does for a fresh websocket
-  connection), replays the browser's handshake in order, and records every message.
-  permessage-deflate is decoded for display. Up to 5000 messages / 32 MB per connection are
-  kept; the connection itself is never limited.
+- **Connections like a browser.** Each upstream host gets one connection over HTTP/2 or up to
+  six over HTTP/1.1, per fingerprint and upstream. Idle upstream connections are not reused
+  after 30 s, since proxies drop idle tunnels.
+- **Retries.** A request that fails on a dead connection (EOF, reset, GOAWAY, a protocol
+  switch) is sent again on a fresh one: up to 3 tries for GET-like methods, 2 for others.
+  Certificate, DNS and timeout errors are not retried.
+- **Timeout.** 90 s per upstream request, body included. Responses are buffered in full before
+  they reach the browser; for very large downloads turn HTTPS decryption off.
+- **WebSockets** open their own connection with the profile's ClientHello and ALPN `http/1.1`,
+  as browsers do for a fresh WebSocket connection. Up to 5000 messages / 32 MB per connection
+  are recorded; the connection itself is not limited.
 - **Loopback targets** (`127.0.0.1`, `localhost`) are always dialed directly, never through
-  the upstream. Some antibot scripts probe local ports over websockets; those fail exactly as
-  they would without the proxy.
-- The client↔proxy leg is negotiated as HTTP/1.1 for clean parsing; this does not affect the
-  HTTP/2 fingerprint presented upstream. Forwarded request headers are lowercased (as HTTP/2
-  and real Firefox require) and the client's `Content-Length` is dropped so the transport
-  frames the body — without this, strict servers reject with `400` / `PROTOCOL_ERROR`.
-- **Save HAR** exports everything currently in the list. Hit **Clear** first for a focused
-  capture of just the next thing you do.
-- **Connections, like Firefox:** each upstream host gets its own clients: one connection for
-  an HTTP/2 host, up to 6 for an HTTP/1.1 host. A slow host can't stall the others.
-  Upstream connections idle for 30 s are not reused (proxies drop idle tunnels).
-- **Retries:** a request that fails on a dead connection (EOF, reset, GOAWAY, a protocol
-  switch) is sent again on a fresh one: up to 3 tries for GET-like methods, 2 for POST.
-  Retried rows carry a "retried" badge. Certificate, DNS and timeout errors are not retried.
-- **Timeout:** 90 s per upstream request, body included. Responses are buffered in full
-  before they reach the browser, so very large downloads are better done with MITM off.
-- **Upstream certificates** are verified against the macOS trust store, like Firefox's own
-  roots. Sites on the Russian national CA (e.g. some `sberbank.ru`, `rambler.ru` endpoints)
-  fail with `x509: certificate signed by unknown authority`.
+  the upstream.
+- **Cleartext `http://`** has no TLS layer to fingerprint and goes through a plain client.
+- **Upstream certificates** are verified against the system trust store.
+- The browser↔netlog leg is HTTP/1.1. That does not change what netlog presents upstream.
 
-## Dev
+## Development
 
-- `third_party/tls-client` is a vendored tls-client v1.16.0 (`replace` in `go.mod`) with two
-  race fixes marked `netlog patch` in `roundtripper.go`. Upstream could panic
-  ("dialTLS returned no error…") or write its transport map without the lock (a fatal
-  concurrent map write) when a host switched between HTTP/1.1 and HTTP/2. Both crashed the
-  whole process. Re-check them before upgrading tls-client.
+- `internal/fp`: the profiles (`chrome.go`, `firefox.go`), detection, and the live probe.
+- `third_party/tls-client`: a vendored [tls-client](https://github.com/bogdanfinn/tls-client)
+  v1.16.0 (4-clause BSD, see `third_party/tls-client/LICENSE`) with two race fixes marked `netlog patch` in
+  `roundtripper.go`. Upstream could panic ("dialTLS returned no error…") or write its
+  transport map without the lock (a fatal concurrent map write) when a host switched between
+  HTTP/1.1 and HTTP/2; both took the whole process down. Re-check them before upgrading.
+- `web/`: the UI, plain HTML, CSS and JavaScript modules embedded into the binary. Fonts are
+  Geist and Geist Mono (SIL OFL, `web/fonts/OFL.txt`).
 
-- `internal/fp/fp.go` — the exact Firefox-158 ClientHello + H2 settings.
-- `go run ./cmd/fpprobe` (add `-proxy http://127.0.0.1:12345`) — prints the live JA3/JA4/
-  Akamai from `tls.peet.ws` to re-verify the fingerprint.
+## License
+
+MIT, see [LICENSE](LICENSE). This product includes software developed by Bogdan Finn
+(tls-client, under its own license in `third_party/tls-client/LICENSE`).

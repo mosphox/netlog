@@ -34,7 +34,13 @@ type webServer struct {
 func (ws *webServer) routes() *stdhttp.ServeMux {
 	mux := stdhttp.NewServeMux()
 	static, _ := fs.Sub(webFS, "web")
-	mux.Handle("GET /", stdhttp.FileServerFS(static))
+	files := stdhttp.FileServerFS(static)
+	mux.HandleFunc("GET /", func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+		// Embedded files carry no modification time; make the browser
+		// revalidate so an upgraded binary never runs a stale UI.
+		w.Header().Set("Cache-Control", "no-cache")
+		files.ServeHTTP(w, r)
+	})
 	mux.HandleFunc("GET /api/status", ws.handleStatus)
 	mux.HandleFunc("GET /api/config", ws.handleGetConfig)
 	mux.HandleFunc("POST /api/config", ws.handleSetConfig)
