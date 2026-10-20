@@ -39,6 +39,7 @@ func (ws *webServer) routes() *stdhttp.ServeMux {
 	mux.HandleFunc("GET /api/config", ws.handleGetConfig)
 	mux.HandleFunc("POST /api/config", ws.handleSetConfig)
 	mux.HandleFunc("GET /api/fingerprints", ws.handleFingerprints)
+	mux.HandleFunc("POST /api/fingerprints/{id}/probe", ws.handleProbe)
 	mux.HandleFunc("POST /api/upstreams/test", ws.handleTestUpstream)
 	mux.HandleFunc("GET /api/logs", ws.handleList)
 	mux.HandleFunc("GET /api/logs/{id}", ws.handleDetail)
@@ -111,6 +112,27 @@ func (ws *webServer) handleSetConfig(w stdhttp.ResponseWriter, r *stdhttp.Reques
 
 func (ws *webServer) handleFingerprints(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 	writeJSON(w, map[string]any{"profiles": fp.All(), "default": fp.Default.ID})
+}
+
+// handleProbe checks one profile live against the reflection service through
+// the active upstream.
+func (ws *webServer) handleProbe(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+	p, ok := fp.Lookup(r.PathValue("id"))
+	if !ok {
+		writeJSON(w, map[string]any{"ok": false, "error": "unknown profile"})
+		return
+	}
+	cfg := ws.srv.cfgStore.get()
+	upURL := ""
+	if u := cfg.upstream(cfg.ActiveUpstream); u != nil {
+		upURL = u.URL
+	}
+	res, err := fp.Probe(p, upURL)
+	if err != nil {
+		writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "result": res})
 }
 
 // handleTestUpstream sends one request through an upstream to an IP-info
